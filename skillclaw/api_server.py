@@ -2239,7 +2239,19 @@ class SkillClawAPIServer:
             k: v for k, v in body.items()
             if k not in {"logprobs", "top_logprobs", "stream_options"}
         }
-        send_body["model"] = self.config.llm_model_id or body.get("model", "")
+        # Model selection: passthrough lets the client choose the upstream model.
+        # Falls back to llm_model_id when (a) passthrough disabled, or (b) the
+        # client sent the proxy's served_model_name (which is not a real upstream id),
+        # or (c) no model was sent at all.
+        client_model = body.get("model", "") or ""
+        if (
+            getattr(self.config, "llm_passthrough_model", False)
+            and client_model
+            and client_model != self._served_model
+        ):
+            send_body["model"] = client_model
+        else:
+            send_body["model"] = self.config.llm_model_id or client_model
         send_body["stream"] = False
 
         headers: dict[str, str] = {}

@@ -62,6 +62,7 @@ class SkillClawConfig:
     llm_api_base: str = ""
     llm_api_key: str = ""
     llm_model_id: str = ""
+    llm_passthrough_model: bool = False
 
     # ------------------------------------------------------------------ #
     # OpenRouter-specific (ignored for other providers)                    #

@@ -21,6 +21,7 @@ _DEFAULTS: dict = {
         "model_id": "",
         "api_base": "",
         "api_key": "",
+        "passthrough_model": False,
     },
     "proxy": {
         "port": 30000,
@@ -239,6 +240,7 @@ class ConfigStore:
             llm_api_base=llm_api_base,
             llm_api_key=llm_api_key,
             llm_model_id=llm_model_id,
+            llm_passthrough_model=bool(llm.get("passthrough_model", False)),
             bedrock_region=llm.get("bedrock_region") or data.get("bedrock_region", "us-east-1"),
             # OpenRouter
             openrouter_app_name=orouter.get("app_name", "SkillClaw"),
