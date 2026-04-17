@@ -121,7 +121,7 @@ def build_skill_md(skill: dict) -> str:
 
         for key, value in extra_fm.items():
             if key not in ("name", "description", "category"):
-                fm_lines.append(f"{key}: {yaml.dump(value, default_flow_style=True).strip()}")
+                fm_lines.append(yaml.dump({key: value}, default_flow_style=True, allow_unicode=True).strip())
 
     return "---\n" + "\n".join(fm_lines) + "\n---\n\n" + content + "\n"
 
