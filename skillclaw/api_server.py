@@ -2336,6 +2336,24 @@ class SkillClawAPIServer:
                             status_code=502,
                             detail=f"Upstream LLM SSE retry failed: {stream_error}",
                         ) from stream_error
+                # Non-retryable client error (4xx except 429): forward upstream
+                # status + body as-is. Retrying a deterministic client error just
+                # wastes ~30s and masks the real status from downstream clients
+                # (e.g. multimodal capability probes whose URL-format fallback
+                # depends on observing 400, not a wrapped 502).
+                if 400 <= e.response.status_code < 500 and e.response.status_code != 429:
+                    logger.error(
+                        "[OpenClaw] upstream LLM client error (no retry): %s %s",
+                        e.response.status_code, response_text,
+                    )
+                    try:
+                        detail = e.response.json()
+                    except Exception:
+                        detail = response_text or str(e)
+                    raise HTTPException(
+                        status_code=e.response.status_code,
+                        detail=detail,
+                    ) from e
                 # Retryable upstream error — retry if attempts remain
                 if attempt < max_retries - 1:
                     wait = min(2 ** attempt + random.uniform(0, 1), 30)
