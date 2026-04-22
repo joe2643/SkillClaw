@@ -254,11 +254,25 @@ class SkillManager:
         self._maybe_flush_stats()
 
     def record_feedback(self, skill_names: list[str], score: float) -> None:
-        """Record PRM feedback for skills that were injected in a turn."""
+        """Record PRM feedback for skills that were injected in a turn.
+
+        Uses setdefault for every counter so entries persisted under an
+        older or hand-edited stats schema (missing positive/negative/
+        neutral_count keys) don't raise ``KeyError``.
+        """
         for name in skill_names:
             entry = self._stats.get(name)
             if entry is None:
                 continue
+            # Backfill counters that may be missing from legacy / hand-edited
+            # stats files before we increment them.
+            for key in (
+                "inject_count",
+                "positive_count",
+                "negative_count",
+                "neutral_count",
+            ):
+                entry.setdefault(key, 0)
             if score > 0:
                 entry["positive_count"] += 1
             elif score < 0:

@@ -24,6 +24,7 @@ class SkillClawConfig:
     prm_m: int = 3
     prm_temperature: float = 0.6
     prm_max_new_tokens: int = 1024
+    prm_concurrency: int = 1  # process-wide cap on in-flight PRM LLM calls
 
     # ------------------------------------------------------------------ #
     # Skills                                                              #

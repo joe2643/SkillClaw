@@ -98,6 +98,7 @@ class SkillClawLauncher:
                 temperature=cfg.prm_temperature,
                 max_new_tokens=cfg.prm_max_new_tokens,
                 llm_client=prm_client,
+                concurrency=cfg.prm_concurrency,
             )
         elif cfg.use_prm and prm_provider == "bedrock":
             logger.warning("[Launcher] PRM enabled but bedrock prm_model is empty; PRM disabled")
@@ -110,6 +111,7 @@ class SkillClawLauncher:
                 temperature=cfg.prm_temperature,
                 max_new_tokens=cfg.prm_max_new_tokens,
                 llm_client=None,
+                concurrency=cfg.prm_concurrency,
             )
         elif cfg.use_prm:
             logger.warning(

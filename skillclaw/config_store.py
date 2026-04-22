@@ -269,6 +269,10 @@ class ConfigStore:
             prm_url=prm_url,
             prm_model=prm_model,
             prm_api_key=prm_api_key,
+            prm_m=int(prm.get("m", 3) or 3),
+            prm_temperature=float(prm.get("temperature", 0.6) or 0.6),
+            prm_max_new_tokens=int(prm.get("max_new_tokens", 1024) or 1024),
+            prm_concurrency=int(prm.get("concurrency", 1) or 1),
             # Model
             model_name=llm.get("model_id") or "Qwen/Qwen3-4B",
             # Claw

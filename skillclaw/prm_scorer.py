@@ -147,6 +147,7 @@ class PRMScorer:
         temperature: float = 0.6,
         max_new_tokens: int = 1024,
         llm_client=None,
+        concurrency: int = 1,
     ):
         if llm_client is not None:
             self._client = llm_client
@@ -167,6 +168,11 @@ class PRMScorer:
         self.prm_m = prm_m
         self.temperature = temperature
         self.max_new_tokens = max_new_tokens
+        # Process-wide throttle: every scoring LLM call, across ALL sessions,
+        # must hold this semaphore. concurrency=1 → strict serial. This
+        # prevents burst-scoring from multiple concurrent sessions (Signal,
+        # WhatsApp, TUI) from saturating the upstream concurrency quota.
+        self._llm_semaphore = asyncio.Semaphore(max(1, concurrency))
 
     async def evaluate(
         self,
@@ -187,9 +193,23 @@ class PRMScorer:
         """
         msgs = _build_prm_judge_prompt(response, instruction)
 
-        results = await asyncio.gather(
-            *[self._query_once(msgs, i) for i in range(self.prm_m)]
-        )
+        # Serial voting: running `prm_m` (default 3) parallel LLM calls per
+        # turn floods the upstream concurrency quota, starving interactive
+        # agent requests.  Since PRM is a fire-and-forget background task,
+        # waiting for votes sequentially is fine — the overall pipeline
+        # just takes ~3x longer for the scoring step, which never blocks
+        # the user-facing response.
+        # Enable parallel mode via `SKILLCLAW_PRM_PARALLEL=1` if the
+        # upstream has headroom.
+        import os as _os
+        if _os.environ.get("SKILLCLAW_PRM_PARALLEL", "0").lower() in ("1","true","yes"):
+            results = await asyncio.gather(
+                *[self._query_once(msgs, i) for i in range(self.prm_m)]
+            )
+        else:
+            results = []
+            for i in range(self.prm_m):
+                results.append(await self._query_once(msgs, i))
 
         scores = [r[0] for r in results]
         final = _majority_vote(scores)
@@ -212,13 +232,14 @@ class PRMScorer:
         self, messages: list[dict], vote_id: int
     ) -> tuple[Optional[int], str]:
         try:
-            completion = await asyncio.to_thread(
-                self._client.chat.completions.create,
-                model=self.prm_model,
-                messages=messages,
-                temperature=self.temperature,
-                max_completion_tokens=self.max_new_tokens,
-            )
+            async with self._llm_semaphore:
+                completion = await asyncio.to_thread(
+                    self._client.chat.completions.create,
+                    model=self.prm_model,
+                    messages=messages,
+                    temperature=self.temperature,
+                    max_completion_tokens=self.max_new_tokens,
+                )
             content = completion.choices[0].message.content or ""
             return _parse_prm_score(content), content
         except Exception as e:
