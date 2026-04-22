@@ -21,7 +21,29 @@ class AsyncLLMClient:
 
     All calls are dispatched to a background thread so the event loop stays
     free while the synchronous ``openai`` SDK performs the HTTP round-trip.
+
+    A process-wide asyncio Semaphore throttles concurrent chat calls so the
+    evolve server does not drown the shared LLM endpoint (e.g. DashScope)
+    when ``judge_sessions_parallel`` / ``summarize_sessions_parallel`` fan
+    out via ``asyncio.gather``. The limit is tuned via the
+    ``EVOLVE_LLM_MAX_CONCURRENCY`` environment variable (default: 1).
     """
+
+    # Class-level shared semaphore — created lazily so it binds to the right
+    # event loop. All AsyncLLMClient instances in this process share the same
+    # quota, which is what we want because they all hit one upstream.
+    _concurrency_semaphore: "asyncio.Semaphore | None" = None
+
+    @classmethod
+    def _get_semaphore(cls) -> "asyncio.Semaphore":
+        if cls._concurrency_semaphore is None:
+            try:
+                limit = int(os.environ.get("EVOLVE_LLM_MAX_CONCURRENCY", "1"))
+            except ValueError:
+                limit = 1
+            limit = max(1, limit)
+            cls._concurrency_semaphore = asyncio.Semaphore(limit)
+        return cls._concurrency_semaphore
 
     def __init__(
         self,
@@ -55,26 +77,28 @@ class AsyncLLMClient:
         }
 
         max_retries = 6
-        for attempt in range(max_retries):
-            try:
-                resp = await asyncio.to_thread(
-                    self._client.chat.completions.create, **merged,
-                )
-                return resp.choices[0].message.content or ""
-            except Exception as exc:
-                body_text = getattr(getattr(exc, "response", None), "text", "") or ""
-                status_code = getattr(getattr(exc, "response", None), "status_code", None)
-                if status_code == 400 and "'temperature' is not supported" in body_text:
-                    merged.pop("temperature", None)
-                    continue
-                if status_code == 400 and "Stream must be set to true" in body_text:
-                    return await self._chat_via_stream(merged)
-                if attempt < max_retries - 1:
-                    import random
-                    wait = min(2 ** attempt + random.uniform(0, 1), 30)
-                    await asyncio.sleep(wait)
-                    continue
-                raise
+        sem = self._get_semaphore()
+        async with sem:
+            for attempt in range(max_retries):
+                try:
+                    resp = await asyncio.to_thread(
+                        self._client.chat.completions.create, **merged,
+                    )
+                    return resp.choices[0].message.content or ""
+                except Exception as exc:
+                    body_text = getattr(getattr(exc, "response", None), "text", "") or ""
+                    status_code = getattr(getattr(exc, "response", None), "status_code", None)
+                    if status_code == 400 and "'temperature' is not supported" in body_text:
+                        merged.pop("temperature", None)
+                        continue
+                    if status_code == 400 and "Stream must be set to true" in body_text:
+                        return await self._chat_via_stream(merged)
+                    if attempt < max_retries - 1:
+                        import random
+                        wait = min(2 ** attempt + random.uniform(0, 1), 30)
+                        await asyncio.sleep(wait)
+                        continue
+                    raise
 
     async def _chat_via_stream(self, body: dict[str, Any]) -> str:
         import json
