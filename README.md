@@ -4,16 +4,14 @@
 
 # ✨ SkillClaw: Let Skills Evolve Collectively with Agentic Evolver ✨
 
-<img src="assets/skillclaw_main.png" alt="SkillClaw Architecture" width="680">
-
-<h3>Evolve distributed AI agent clusters in production — just talk.<br>Experience auto-distilled. Skills keep growing. Collective intelligence shared in real time.</h3>
+<h3>AI agent skills that evolve from every real interaction — just talk.<br>Across sessions, agents, devices, and users. Experience compounds. Skills keep growing.</h3>
 
 | 🚀 Quick Install | 💬 Just Chat | 🔌 Broad Compatibility | 🧬 Collective Skill Evolution |
 |:-:|:-:|:-:|:-:|
 
 [![Hermes](https://img.shields.io/badge/Hermes-supported-ff6b6b?style=flat-square&logo=data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0id2hpdGUiIGQ9Ik0xMiAyTDIgN2wxMCA1IDEwLTV6TTIgMTdsOSA1VjEyTDIgN3pNMTMgMjJsOS01VjdMMTMgMTJ6Ii8+PC9zdmc+)](https://github.com/NousResearch/hermes-agent)
 [![OpenClaw](https://img.shields.io/badge/OpenClaw-supported-6c5ce7?style=flat-square)](https://github.com/openclaw/openclaw)
-[![Agents](https://img.shields.io/badge/+CoPaw%20%7C%20IronClaw%20%7C%20PicoClaw%20%7C%20ZeroClaw%20%7C%20...-8A2BE2?style=flat-square)](https://github.com/AMAP-ML/SkillClaw)
+[![Agents](https://img.shields.io/badge/+QwenPaw%20%7C%20IronClaw%20%7C%20PicoClaw%20%7C%20ZeroClaw%20%7C%20...-8A2BE2?style=flat-square)](https://github.com/AMAP-ML/SkillClaw)
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
 [![License](https://img.shields.io/badge/License-MIT-green?style=flat-square)](./LICENSE)
 [![Paper](https://img.shields.io/badge/Paper-arXiv-b5212f.svg?style=flat-square&logo=arxiv)](https://arxiv.org/abs/2604.08377)
@@ -24,7 +22,7 @@
 
 <br>
 
-<a href="https://github.com/AMAP-ML/SkillClaw"><img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=18&duration=2500&pause=1000&color=58A6FF&center=true&vCenter=true&width=750&lines=Collective+Skill+Evolution+for+AI+Agents;Hermes+%C2%B7+OpenClaw+%C2%B7+CoPaw+%C2%B7+IronClaw+%C2%B7+PicoClaw+%C2%B7+ZeroClaw+and+more" alt="Typing SVG" /></a>
+<a href="https://github.com/AMAP-ML/SkillClaw"><img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=18&duration=2500&pause=1000&color=58A6FF&center=true&vCenter=true&width=750&lines=Collective+Skill+Evolution+for+AI+Agents;Hermes+%C2%B7+OpenClaw+%C2%B7+QwenPaw+%C2%B7+IronClaw+%C2%B7+PicoClaw+%C2%B7+ZeroClaw+and+more" alt="Typing SVG" /></a>
 
 <img src="assets/terminal_cmd.svg" alt="skillclaw setup && skillclaw start --daemon" width="620">
 
@@ -43,11 +41,11 @@
 </tr>
 <tr>
 <td>🔌 <b>Broad Compatibility</b></td>
-<td>Natively integrates with <a href="https://github.com/NousResearch/hermes-agent">Hermes</a>, <a href="https://github.com/openclaw/openclaw">OpenClaw</a>, <a href="https://github.com/agentscope-ai/CoPaw">CoPaw</a>, <a href="https://github.com/nearai/ironclaw">IronClaw</a>, <a href="https://github.com/sipeed/picoclaw">PicoClaw</a>, <a href="https://github.com/zeroclaw-labs/zeroclaw">ZeroClaw</a>, <a href="https://github.com/qwibitai/NanoClaw">NanoClaw</a>, <a href="https://github.com/NVIDIA/NemoClaw">NemoClaw</a>, and any OpenAI-compatible API.</td>
+<td>Natively integrates with <a href="https://github.com/NousResearch/hermes-agent">Hermes</a>, <a href="https://github.com/openai/codex">Codex</a>, <a href="https://docs.anthropic.com/en/docs/claude-code">Claude Code</a>, <a href="https://github.com/openclaw/openclaw">OpenClaw</a>, <a href="https://github.com/agentscope-ai/QwenPaw">QwenPaw</a>, <a href="https://github.com/nearai/ironclaw">IronClaw</a>, <a href="https://github.com/sipeed/picoclaw">PicoClaw</a>, <a href="https://github.com/zeroclaw-labs/zeroclaw">ZeroClaw</a>, <a href="https://github.com/qwibitai/NanoClaw">NanoClaw</a>, <a href="https://github.com/NVIDIA/NemoClaw">NemoClaw</a>, and any OpenAI-compatible API.</td>
 </tr>
 <tr>
 <td>🧬 <b>Collective Skill Evolution</b></td>
-<td>Real-world experience from multiple users and agents is distilled into reusable Skills, shared via the cloud, enabling continuous evolution across the entire agent cluster.</td>
+<td>Skills evolve from every session, every agent, every context. Solo or team — the loop is the same. Every experience compounds.</td>
 </tr>
 </table>
 
@@ -55,17 +53,69 @@
 
 <div align="center">
 
-## From Experience Silos to Collective Evolution
+## What SkillClaw Brings to One Hermes User
+
+</div>
+
+Been using Hermes for a while — is your skill library still a mess? Duplicates, outdated ones, half-baked ones all piled together like an unsorted loot box. The problem isn't that Hermes doesn't learn enough — it's that nobody helps it **digest**.
+
+**SkillClaw is built for this.** Auto-evolve, auto-deduplicate, auto-improve quality. It won't change how you work or interrupt your flow — it just quietly rewrites your agent's growth curve.
+
+SkillClaw doesn't make Hermes learn more — it makes everything Hermes has learned actually count.
+
+<div align="center">
+
+<img src="assets/two_loops.svg" alt="Two Loops: Hermes task-time loop + SkillClaw post-task evolution loop" width="860">
+
+</div>
+
+That's just one user's story. One user can also run multiple agents or use multiple devices — SkillClaw unifies them all:
+
+<div align="center">
+
+### Multiple agents? One unified skill library.
+
+<img src="assets/multiplier_effect.svg" alt="The Multiplier Effect: Multiple Hermes agents sharing skills through SkillClaw" width="860">
+
+</div>
+
+Running multiple Hermes agents for different tasks? Without SkillClaw, each builds its own isolated skill silo. With SkillClaw, skills are **merged, deduplicated, and cross-pollinated** into a unified library, then distributed back to all agents. Your Frontend agent's React patterns make the Backend agent's API design better — and vice versa.
+
+<div align="center">
+
+### Multiple devices? Skills follow you, not your machine.
+
+<img src="assets/cross_context.svg" alt="Seamless Context: Home, School, and Company Hermes instances unified by SkillClaw" width="860">
+
+</div>
+
+Same user, different machines. Your Home Hermes learns React; your School Hermes learns ML; your Work Hermes learns K8s. Without SkillClaw, each starts from scratch. With it, **skills unify across all environments** — every Hermes instance benefits from every other's experience, regardless of where you are.
+
+---
+
+<div align="center">
+
+## Collective Skill Evolution
+
+</div>
+
+Everything above is what one user gets. Now scale it up: when you join a shared group, **every team member's real-world experience feeds into the same evolution loop**. User A debugs a database issue — the skill evolves. User B, C, D benefit instantly without ever hitting the same problem. N users, one Skill, continuous evolution.
+
+<div align="center">
 
 <img src="assets/shift_contrast.svg" alt="The Shift: From Experience Silos to Collective Evolution" width="860">
 
 <br>
 
-## How a Skill Evolves
+<img src="assets/skill_evolution.svg" alt="Skill Evolution Flow: How a skill evolves across multiple users" width="860">
 
-<img src="assets/skill_evolution.svg" alt="Skill Evolution Flow" width="860">
+</div>
 
-**N users, one Skill, continuous evolution.** Every conversation compounds. Every user contributes.
+---
+
+<div align="center">
+
+<img src="assets/skillclaw_main.png" alt="SkillClaw Architecture" width="680">
 
 </div>
 
@@ -83,13 +133,13 @@
 
 ## Overview
 
-SkillClaw makes LLM agents progressively better by **evolving reusable skills** from real session data and sharing them across a group of agents.
+SkillClaw makes LLM agents progressively better by **evolving reusable skills** from real session data. A single user already benefits — skills are automatically deduplicated, improved, and verified across sessions. Scale up when you're ready: multiple agents, multiple devices, or multiple users can all feed the same evolution loop.
 
 The system has two components:
 
-1. **Client Proxy** — A local API proxy (`/v1/chat/completions`, `/v1/messages`) that intercepts agent requests, records session artifacts, and syncs skills with shared storage.
+1. **Client Proxy** — A local API proxy (`/v1/chat/completions`, `/v1/messages`) that intercepts agent requests, records session artifacts, and manages your local skill library. This is all you need to get started.
 
-2. **Evolve Server** (`evolve_server`) — A single evolve service that reads session data from shared storage, evolves or creates skills, and writes them back. It supports two engines:
+2. **Evolve Server** (`evolve_server`) — An optional service that reads session data from shared storage, evolves or creates skills, and writes them back. Add it when you want automatic evolution or team-wide sharing. It supports two engines:
    - `workflow`: fixed 3-stage LLM pipeline (Summarize → Aggregate → Execute)
    - `agent`: OpenClaw-driven agent workspace with direct skill editing
 
@@ -99,13 +149,12 @@ Both components share the same storage layer (Alibaba OSS / S3 / local filesyste
 
 ## Deployment Model
 
-Think of SkillClaw as "per-user client, per-group evolver":
+Start with just the client. Add the server when you need it.
 
-1. Every user runs a local `skillclaw` client proxy on their own machine.
-2. One shared group usually runs one `skillclaw-evolve-server`.
-3. The client side and server side only meet through shared storage (`local`, `oss`, or `s3`).
+1. **Single user + auto-evolution**: Install the client proxy, then add an evolve server on the same machine (or anywhere that can reach your storage) to automatically refine skills in the background.
+2. **Team / shared group**: Point multiple clients at the same shared storage and run one `skillclaw-evolve-server` for the group. Everyone's experience feeds the same evolution loop.
 
-This separation is the key beginner mental model:
+The client and server only meet through shared storage (`local`, `oss`, or `s3`). This means:
 
 - If you only want to use SkillClaw yourself, install the client first. You can add an evolve server later.
 - If you want to join an existing team, you still install only the client. You do not run the evolve server unless you are operating the shared group.
@@ -159,7 +208,7 @@ The setup wizard prompts for the provider, model, local skills directory, PRM se
 For a minimal first run:
 
 - choose `none` for the CLI agent if you do not want SkillClaw to auto-configure an external agent yet
-- local skills at `~/.skillclaw/skills`
+- local skills at `~/.skillclaw/skills` for the generic setup path; if you choose Hermes, Codex, or Claude Code, the default local library becomes `~/.hermes/skills`, `~/.codex/skills`, or `~/.claude/skills`
 - disable shared storage if you only want to use the local proxy first
 - enable local shared storage only if you want to add the evolve server later on the same machine, and use a dedicated root such as `~/.skillclaw/local-share`
 - disable PRM if you want the cheapest first pass
@@ -187,6 +236,8 @@ If you already use Hermes, the client-side path is:
 2. Run `skillclaw setup` and choose `hermes` for `CLI agent to configure`.
 3. Keep `Proxy model name exposed to agents` as `skillclaw-model` unless you have a specific reason to change it.
 4. Start SkillClaw. On startup, SkillClaw rewrites `~/.hermes/config.yaml` to point Hermes at the local proxy.
+5. Hermes uses `~/.hermes/skills` as the default local skill library. SkillClaw prepares that directory automatically and copies in any missing legacy skills from `~/.skillclaw/skills`.
+6. If you want to inspect or undo the integration, use `skillclaw doctor hermes` and `skillclaw restore hermes`.
 
 Minimal verification:
 
@@ -194,6 +245,15 @@ Minimal verification:
 skillclaw start --daemon
 hermes chat -Q -m skillclaw-model -q "Reply with exactly HERMES_SKILLCLAW_OK and nothing else."
 ```
+
+Optional diagnostics:
+
+```bash
+skillclaw doctor hermes
+skillclaw restore hermes
+```
+
+`skillclaw doctor hermes` reports whether Hermes is pointed at the local proxy, whether the Hermes skills directory exists, whether legacy skills are still present, and that session boundaries still fall back to proxy-side heuristics unless Hermes sends explicit session headers.
 
 ### Path B: Join an existing shared group
 
