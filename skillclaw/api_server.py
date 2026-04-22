@@ -13,6 +13,40 @@ import json
 import logging
 import os
 import queue
+
+# --- Video debug logging ---
+_VIDEO_DEBUG_LOG = "/tmp/skillclaw_video_debug.jsonl"
+
+
+def _has_video_content(messages: list) -> bool:
+    """Check if any message contains video_url content."""
+    for msg in messages:
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if isinstance(content, list):
+            for item in content:
+                if isinstance(item, dict) and item.get("type") in (
+                    "video_url", "video",
+                ):
+                    return True
+    return False
+
+
+def _log_video_debug(label: str, data: dict) -> None:
+    """Append a video debug entry to the JSONL log."""
+    import datetime as _dt
+    entry = {
+        "ts": _dt.datetime.now().isoformat(),
+        "label": label,
+        **data,
+    }
+    try:
+        with open(_VIDEO_DEBUG_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False, default=str) + "\n")
+    except Exception as e:
+        logging.getLogger(__name__).warning(
+            "video debug log write failed: %s", e,
+        )
+# --- End video debug logging ---
 import random
 import re
 import threading
@@ -1292,6 +1326,14 @@ class SkillClawAPIServer:
 
             body = await request.json()
             incoming_messages = body.get("messages", [])
+            # --- Video debug: log inbound from QwenPaw ---
+            if isinstance(incoming_messages, list) and _has_video_content(incoming_messages):
+                _log_video_debug("INBOUND_FROM_QWENPAW", {
+                    "model": body.get("model"),
+                    "num_messages": len(incoming_messages),
+                    "messages": incoming_messages,
+                })
+            # --- End video debug ---
             if isinstance(incoming_messages, list):
                 rewritten_messages, rewritten = _rewrite_new_session_bootstrap_prompt(
                     incoming_messages
@@ -2279,6 +2321,18 @@ class SkillClawAPIServer:
                 send_body.setdefault("provider", {})
                 send_body["provider"]["data_collection"] = "deny"
 
+        # --- Video debug: log outbound to LLM ---
+        _send_msgs = send_body.get("messages", [])
+        _is_video_req = isinstance(_send_msgs, list) and _has_video_content(_send_msgs)
+        if _is_video_req:
+            _log_video_debug("OUTBOUND_TO_LLM", {
+                "api_base": api_base,
+                "model": send_body.get("model"),
+                "num_messages": len(_send_msgs),
+                "messages": _send_msgs,
+            })
+        # --- End video debug ---
+
         max_retries = 6
         for attempt in range(max_retries):
             try:
@@ -2289,7 +2343,16 @@ class SkillClawAPIServer:
                         headers=headers,
                     )
                     resp.raise_for_status()
-                    return resp.json()
+                    _resp_json = resp.json()
+                    # --- Video debug: log LLM response ---
+                    if _is_video_req:
+                        _log_video_debug("LLM_RESPONSE", {
+                            "model": _resp_json.get("model"),
+                            "choices": _resp_json.get("choices"),
+                            "usage": _resp_json.get("usage"),
+                        })
+                    # --- End video debug ---
+                    return _resp_json
             except httpx.HTTPStatusError as e:
                 response_text = e.response.text[:200]
                 if (
@@ -2336,12 +2399,37 @@ class SkillClawAPIServer:
                             status_code=502,
                             detail=f"Upstream LLM SSE retry failed: {stream_error}",
                         ) from stream_error
-                # Non-retryable client error (4xx except 429): forward upstream
+                # 429 Too Many Requests: pass through as-is (with Retry-After)
+                # so the CLIENT's rate limiter (e.g. CoPaw's global LLMRateLimiter
+                # at retry_chat_model.py) can engage its global back-pressure
+                # pause.  Retrying 6× inside the proxy just amplifies account-
+                # level concurrency pressure and masks the real signal from the
+                # caller, which then keeps hammering instead of backing off.
+                if e.response.status_code == 429:
+                    retry_after = (
+                        e.response.headers.get("retry-after")
+                        or e.response.headers.get("Retry-After")
+                        or "5"
+                    )
+                    try:
+                        detail = e.response.json()
+                    except Exception:
+                        detail = response_text or str(e)
+                    logger.warning(
+                        "[OpenClaw] upstream 429 — passthrough with Retry-After=%s",
+                        retry_after,
+                    )
+                    raise HTTPException(
+                        status_code=429,
+                        detail=detail,
+                        headers={"Retry-After": str(retry_after)},
+                    ) from e
+                # Non-retryable client error (4xx): forward upstream
                 # status + body as-is. Retrying a deterministic client error just
                 # wastes ~30s and masks the real status from downstream clients
                 # (e.g. multimodal capability probes whose URL-format fallback
                 # depends on observing 400, not a wrapped 502).
-                if 400 <= e.response.status_code < 500 and e.response.status_code != 429:
+                if 400 <= e.response.status_code < 500:
                     logger.error(
                         "[OpenClaw] upstream LLM client error (no retry): %s %s",
                         e.response.status_code, response_text,
@@ -2354,7 +2442,7 @@ class SkillClawAPIServer:
                         status_code=e.response.status_code,
                         detail=detail,
                     ) from e
-                # Retryable upstream error — retry if attempts remain
+                # Retryable 5xx upstream error — retry if attempts remain
                 if attempt < max_retries - 1:
                     wait = min(2 ** attempt + random.uniform(0, 1), 30)
                     logger.warning(
@@ -2366,16 +2454,35 @@ class SkillClawAPIServer:
                 logger.error("[OpenClaw] upstream LLM error: %s %s", e.response.status_code, response_text)
                 raise HTTPException(status_code=502, detail=f"Upstream LLM error: {e}") from e
             except Exception as e:
-                if attempt < max_retries - 1:
-                    wait = min(2 ** attempt + random.uniform(0, 1), 30)
+                # Transport-level failure (connection reset, read timeout,
+                # pool exhausted, DNS, TLS).  These are very often symptoms
+                # of upstream being saturated (DashScope drops connections
+                # silently when concurrency quota is hit), so don't retry
+                # 6× — cap at 2 so the caller sees an error within ~60s
+                # and its own rate-limiter / retry logic can take over.
+                transport_max = min(2, max_retries - 1)
+                if attempt < transport_max:
+                    wait = min(2 ** attempt + random.uniform(0, 1), 10)
                     logger.warning(
-                        "[OpenClaw] LLM forward failed (attempt %d/%d), retrying in %.1fs: %s",
-                        attempt + 1, max_retries, wait, e,
+                        "[OpenClaw] LLM forward failed (attempt %d/%d), retrying in %.1fs: %s: %s",
+                        attempt + 1, transport_max + 1, wait,
+                        type(e).__name__, str(e) or "(no message)",
                     )
                     await asyncio.sleep(wait)
                     continue
-                logger.error("[OpenClaw] LLM forward failed: %s", e, exc_info=True)
-                raise HTTPException(status_code=502, detail=f"LLM forward error: {e}") from e
+                logger.error(
+                    "[OpenClaw] LLM forward failed after %d attempts: %s: %s",
+                    attempt + 1, type(e).__name__, str(e) or "(no message)",
+                    exc_info=True,
+                )
+                # Surface as 503 with Retry-After so the caller (CoPaw) sees
+                # a service-unavailable signal and can back off, instead of
+                # interpreting a generic 502 as "try again immediately".
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"LLM upstream unreachable: {type(e).__name__}: {str(e) or '(no message)'}",
+                    headers={"Retry-After": "5"},
+                ) from e
 
     async def _forward_to_llm_bedrock(self, body: dict[str, Any]) -> dict[str, Any]:
         """Forward to AWS Bedrock via BedrockChatClient."""
@@ -2472,15 +2579,31 @@ class SkillClawAPIServer:
     # ------------------------------------------------------------------ #
 
     async def _pull_skills_from_cloud(self) -> None:
-        """Pull latest skills from cloud storage and reload the skill manager.
+        """Sync local skills with the shared manifest at session end.
 
-        This is a *read-only* operation — local skills are never pushed
-        automatically.  Use ``skillclaw skills push`` for explicit uploads.
+        Uses ``mirror=False`` on pull so locally-added skills (e.g. created
+        by CoPaw) are never auto-deleted.  Also auto-registers any local
+        skill not yet in the manifest via a filtered push, so the evolve
+        server can discover and evolve newly-created skills without manual
+        ``skillclaw skills push`` invocation.
         """
         try:
             from .skill_hub import SkillHub
             hub = SkillHub.from_config(self.config)
-            pull_result = hub.pull_skills(self.config.skills_dir)
+            pull_result = hub.pull_skills(self.config.skills_dir, mirror=False)
+            # Auto-register any local skill missing from the manifest so the
+            # evolve server's manifest-based loop discovers them. Push runs
+            # with no filter (brand-new skills have no stats and are always
+            # allowed through); it's idempotent for entries whose sha256
+            # already matches the manifest (counted as "skipped").
+            push_result = await asyncio.to_thread(
+                hub.push_skills, self.config.skills_dir,
+            )
+            if push_result.get("uploaded"):
+                logger.info(
+                    "[SkillHub] auto-registered %d new local skill(s) "
+                    "into shared manifest", push_result["uploaded"],
+                )
             logger.info(
                 "[SkillHub] skill pull: %d downloaded, %d unchanged, %d deleted",
                 pull_result["downloaded"], pull_result["skipped"], pull_result.get("deleted", 0),

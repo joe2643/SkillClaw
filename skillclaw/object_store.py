@@ -88,8 +88,14 @@ class LocalObjectStore:
     def put_object(self, key: str, data: bytes | str | io.IOBase) -> None:
         path = os.path.join(self._root, key)
         os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Fully materialize the payload BEFORE opening the target for write.
+        # When the local pool overlaps with a caller-provided source path
+        # (e.g. unified storage where skills_dir == pool), opening ``path``
+        # for write before reading ``data`` would truncate the source file
+        # and silently write an empty blob.
+        payload = _read_bytes(data)
         with open(path, "wb") as f:
-            f.write(_read_bytes(data))
+            f.write(payload)
 
     def delete_object(self, key: str) -> None:
         path = os.path.join(self._root, key)
