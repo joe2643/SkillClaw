@@ -19,6 +19,7 @@ import hashlib
 import json
 import logging
 import os
+import pathlib
 import shutil
 import glob
 from datetime import datetime, timezone
@@ -642,3 +643,123 @@ class SkillHub:
         pull_result = self.pull_skills(skills_dir, mirror=False)
         push_result = self.push_skills(skills_dir)
         return {"pull": pull_result, "push": push_result}
+
+    # ------------------------------------------------------------------ #
+    # Delete (local + remote)                                              #
+    # ------------------------------------------------------------------ #
+
+    def delete_skill(
+        self,
+        skill_name: str,
+        skills_dir: str,
+        downstream_dirs: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
+        """Remove a skill from every store SkillClaw knows about.
+
+        Five-step purge that maps directly to what users have to do by hand
+        today: client cache, shared final pool, manifest entry, registry
+        entry, and any opt-in downstream paths (e.g. CoPaw workspace
+        skill_pool / per-agent skills/ dirs).
+
+        Parameters
+        ----------
+        skill_name: canonical name (matches the dir name + manifest key)
+        skills_dir: SkillClaw client cache root (= ``config.skills_dir``)
+        downstream_dirs: extra parent dirs to scan for ``<dir>/<skill_name>/``;
+            each match is removed.  Used by the ``--also-copaw`` CLI flag
+            to clean per-agent CoPaw workspace overrides without
+            hard-coding paths into SkillClaw.
+
+        Returns
+        -------
+        dict summary with bools/counts:
+            ``client_cache_removed``,
+            ``remote_skill_removed``,
+            ``manifest_entry_removed``,
+            ``registry_entry_removed``,
+            ``downstream_removed`` (list of paths cleaned).
+
+        Idempotent: missing pieces are silently OK.  Never raises on
+        partial state — always tries every step.
+        """
+        result: dict[str, Any] = {
+            "skill_name": skill_name,
+            "client_cache_removed": False,
+            "remote_skill_removed": False,
+            "manifest_entry_removed": False,
+            "registry_entry_removed": False,
+            "downstream_removed": [],
+            "errors": [],
+        }
+
+        # 1. Client cache (typically ``~/.skillclaw/skills/<name>`` or
+        #    whatever skills_dir points at — for the user's CoPaw setup
+        #    this collapses to ``~/.copaw/skill_pool/<name>``).
+        local = pathlib.Path(skills_dir).expanduser() / skill_name
+        if local.exists():
+            try:
+                shutil.rmtree(local)
+                result["client_cache_removed"] = True
+            except OSError as e:
+                result["errors"].append(f"client_cache: {e}")
+
+        # 2. Remote object (final pool).  Uses the same bucket
+        #    abstraction push/pull go through, so works for local / OSS / S3.
+        try:
+            self._bucket.delete_object(self._skill_key(skill_name))
+            result["remote_skill_removed"] = True
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # Bucket impls raise different exceptions on missing key;
+            # treat all as best-effort and log only on real errors.
+            if not is_not_found_error(e):
+                result["errors"].append(f"remote_object: {e}")
+
+        # 3. Manifest entry — load, drop the row, save back.
+        try:
+            manifest = self._load_remote_manifest()
+            if skill_name in manifest:
+                del manifest[skill_name]
+                self._save_remote_manifest(manifest)
+                result["manifest_entry_removed"] = True
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            result["errors"].append(f"manifest: {e}")
+
+        # 4. Registry entry — only meaningful for the local backend
+        #    (evolve_skill_registry.json sits next to manifest.jsonl
+        #    under the group prefix).  Best-effort: read JSON, drop key,
+        #    write back.  No-op for OSS/S3 unless registry has been
+        #    synced there.
+        try:
+            reg_key = f"{self._prefix()}evolve_skill_registry.json"
+            try:
+                raw = self._bucket.get_object(reg_key).read().decode("utf-8")
+                reg = json.loads(raw)
+            except Exception as e:  # pylint: disable=broad-exception-caught
+                if is_not_found_error(e):
+                    reg = None
+                else:
+                    raise
+            if isinstance(reg, dict) and skill_name in reg:
+                del reg[skill_name]
+                self._bucket.put_object(
+                    reg_key,
+                    json.dumps(reg, indent=2, ensure_ascii=False).encode("utf-8"),
+                )
+                result["registry_entry_removed"] = True
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            result["errors"].append(f"registry: {e}")
+
+        # 5. Downstream dirs (opt-in via --also-copaw).
+        for parent in downstream_dirs or []:
+            for match in pathlib.Path(parent).expanduser().parent.glob(
+                pathlib.Path(parent).expanduser().name,
+            ):
+                target = match / skill_name
+                if target.is_dir():
+                    try:
+                        shutil.rmtree(target)
+                        result["downstream_removed"].append(str(target))
+                    except OSError as e:
+                        result["errors"].append(f"downstream {target}: {e}")
+
+        return result

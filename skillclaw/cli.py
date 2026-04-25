@@ -722,5 +722,72 @@ def skills_list_remote():
         click.echo()
 
 
+@skills.command(name="delete")
+@click.argument("name")
+@click.option(
+    "--force", "-f", is_flag=True,
+    help="Skip the confirmation prompt.",
+)
+@click.option(
+    "--also-copaw", is_flag=True,
+    help=(
+        "Also remove per-agent overrides from "
+        "``~/.copaw/workspaces/*/skills/<name>/``.  Off by default — "
+        "client cache + shared pool + manifest are always cleaned."
+    ),
+)
+def skills_delete(name: str, force: bool, also_copaw: bool):
+    """Remove a skill from every store SkillClaw knows about.
+
+    Wraps SkillHub.delete_skill — five-step purge that maps directly
+    to what users had to do by hand: client cache, shared final pool,
+    manifest entry, registry entry, and (with --also-copaw) per-agent
+    CoPaw workspace overrides.
+    """
+    cs = ConfigStore()
+    cfg, hub = _require_sharing(cs)
+
+    if not force:
+        click.echo(f"This will delete '{name}' from:")
+        click.echo(f"  • client cache: {cfg.skills_dir}/{name}")
+        click.echo(f"  • shared pool / manifest / registry "
+                   f"({_sharing_target(cfg)})")
+        if also_copaw:
+            click.echo(
+                f"  • per-agent overrides under "
+                "~/.copaw/workspaces/*/skills/" + name
+            )
+        if not click.confirm("Proceed?", default=False):
+            click.echo("Cancelled.")
+            return
+
+    downstream = (
+        ["~/.copaw/workspaces/*/skills"] if also_copaw else []
+    )
+    result = hub.delete_skill(
+        skill_name=name,
+        skills_dir=cfg.skills_dir,
+        downstream_dirs=downstream,
+    )
+
+    click.echo("\nResult:")
+    click.echo(f"  client cache:     "
+               f"{'✓' if result['client_cache_removed'] else '—'}")
+    click.echo(f"  remote skill:     "
+               f"{'✓' if result['remote_skill_removed'] else '—'}")
+    click.echo(f"  manifest entry:   "
+               f"{'✓' if result['manifest_entry_removed'] else '—'}")
+    click.echo(f"  registry entry:   "
+               f"{'✓' if result['registry_entry_removed'] else '—'}")
+    if result["downstream_removed"]:
+        click.echo(f"  downstream:       {len(result['downstream_removed'])} dir(s)")
+        for p in result["downstream_removed"]:
+            click.echo(f"    - {p}")
+    if result["errors"]:
+        click.echo(f"\nNon-fatal errors:")
+        for e in result["errors"]:
+            click.echo(f"  ! {e}")
+
+
 if __name__ == "__main__":
     skillclaw()
