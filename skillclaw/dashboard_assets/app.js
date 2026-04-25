@@ -1630,6 +1630,7 @@ function renderCandidateDetail(job) {
       </section>
       ${renderCandidateStages(job, linkedDetail)}
       ${renderDispatchSection(job)}
+      ${renderManualReviewSection(job)}
       <section class="detail-card">
         <div class="headline-row">
           <div>
@@ -1800,6 +1801,41 @@ function renderDispatchSection(job) {
       ${core.source
         ? `<p class="soft-copy">${escapeHtml(l("候选来源：{source}", "Candidate source: {source}", { source: candidateSourceLabel(core.source) }))}</p>`
         : ""}
+    </section>
+  `
+}
+
+function renderManualReviewSection(job) {
+  const status = candidateStatusKey(job.status)
+  if (status !== "pending" && status !== "review") {
+    return ""
+  }
+  const jobId = String(job.job_id || "")
+  const skillName = String(job.skill_name || "")
+  return `
+    <section class="detail-card tone-current">
+      <div class="headline-row">
+        <div>
+          <p class="kicker">${escapeHtml(l("人工决策", "Manual Review"))}</p>
+          <h4>${escapeHtml(l("直接通过或拒绝这条候选，无需等待 replay 验证", "Approve or reject this candidate directly, without waiting for replay validation"))}</h4>
+          <p class="soft-copy">${escapeHtml(l("决策会以 dashboard 用户身份写回 validation_results/，并触发一次 evolve_server tick 把候选转入最终池或拒绝池。", "Your decision is recorded as a dashboard reviewer in validation_results/ and triggers an evolve_server tick that promotes or rejects the candidate."))}</p>
+        </div>
+      </div>
+      <div class="action-row">
+        <button data-review-action="approve"
+                data-review-job="${escapeHtml(jobId)}"
+                data-review-skill="${escapeHtml(skillName)}"
+                type="button">
+          ${escapeHtml(l("通过", "Approve"))}
+        </button>
+        <button class="ghost danger"
+                data-review-action="reject"
+                data-review-job="${escapeHtml(jobId)}"
+                data-review-skill="${escapeHtml(skillName)}"
+                type="button">
+          ${escapeHtml(l("拒绝", "Reject"))}
+        </button>
+      </div>
     </section>
   `
 }
@@ -2478,6 +2514,61 @@ async function deleteSkillFlow(skillId, displayName) {
   }
 }
 
+async function submitCandidateReview(jobId, action, skillName) {
+  if (state.loading) {
+    return
+  }
+  const accepted = action === "approve"
+  const displayName = skillName || jobId
+  const confirmText = accepted
+    ? l(
+      `确定通过 "${displayName}"？这会写回 validation_results/ 并触发 evolve_server 把候选转入最终池。`,
+      `Approve "${displayName}"? This writes a result and triggers evolve_server to promote the candidate to the final pool.`,
+    )
+    : l(
+      `确定拒绝 "${displayName}"？这会写回 validation_results/ 并触发 evolve_server 把候选标记为已拒绝。`,
+      `Reject "${displayName}"? This writes a result and triggers evolve_server to mark the candidate as rejected.`,
+    )
+  if (!window.confirm(confirmText)) {
+    return
+  }
+  const notes = (window.prompt(
+    l("可选：留下备注（直接确定即可跳过）。", "Optional: leave a note (press OK to skip)."),
+    "",
+  ) || "").trim()
+
+  setLoading(true)
+  try {
+    const url = `/api/v1/validation/jobs/${encodeURIComponent(jobId)}/review`
+    const result = await getJson(url, {
+      method: "POST",
+      body: JSON.stringify({
+        accepted,
+        notes,
+        auto_finalize: true,
+      }),
+    })
+    const finalize = result?.finalize || {}
+    const finalizeNote = finalize.published_count !== undefined
+      ? l(
+        `evolve_server 完成：发布 ${finalize.published_count || 0}，拒绝 ${finalize.rejected_count || 0}。`,
+        `evolve_server done: published ${finalize.published_count || 0}, rejected ${finalize.rejected_count || 0}.`,
+      )
+      : ""
+    showMessage(
+      "success",
+      `${accepted
+        ? l(`已通过 "${displayName}"。`, `Approved "${displayName}".`)
+        : l(`已拒绝 "${displayName}"。`, `Rejected "${displayName}".`)} ${finalizeNote}`.trim(),
+    )
+    await refreshData()
+  } catch (error) {
+    showMessage("error", error.message || l("决策失败", "Review failed"))
+  } finally {
+    setLoading(false)
+  }
+}
+
 async function runOperation(op) {
   if (state.loading) {
     return
@@ -2585,9 +2676,18 @@ async function handleDocumentClick(event) {
     return
   }
   const target = origin.closest(
-    "button, [data-select-local-skill], [data-select-final-skill], [data-select-candidate], [data-select-session], [data-view], [data-delete-skill]"
+    "button, [data-select-local-skill], [data-select-final-skill], [data-select-candidate], [data-select-session], [data-view], [data-delete-skill], [data-review-action]"
   )
   if (!(target instanceof HTMLElement)) {
+    return
+  }
+
+  if (target.dataset.reviewAction) {
+    await submitCandidateReview(
+      target.dataset.reviewJob || "",
+      target.dataset.reviewAction,
+      target.dataset.reviewSkill || "",
+    )
     return
   }
 

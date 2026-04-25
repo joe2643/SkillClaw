@@ -498,6 +498,47 @@ def _derive_instruction_response_pair(
     return instruction.strip(), response.strip()
 
 
+def _attach_flat_turn_text(session: dict) -> None:
+    """Backfill ``prompt_text`` / ``response_text`` on each turn from
+    the OpenAI-shape ``messages`` block.
+
+    The proxy era's ingest record carried these flat fields directly
+    (see ``TOLERATED_EXTRAS`` in CoPaw's capture-schema contract test),
+    but the in-process CoPaw capture hook only emits ``messages``.
+    Several downstream sites then silently degrade:
+
+    * ``evolve_server.engines.workflow._build_replay_cases`` — without
+      ``prompt_text``/``response_text`` it produces an empty
+      ``replay_cases`` list, which causes every queued validation job
+      to fail with ``validation job missing replay_cases``.
+    * The summarizer's own trajectory and judge prompts read flat
+      fields too.
+
+    Run this once per session before the metadata extractor and the
+    lazy PRM pass — both then read consistent values.
+
+    Idempotent: turns that already have both fields are skipped.
+    """
+    turns = session.get("turns") or []
+    if not turns:
+        return
+    turns.sort(key=lambda t: int(t.get("turn_num") or 0))
+
+    for i, turn in enumerate(turns):
+        has_prompt = isinstance(turn.get("prompt_text"), str) and turn["prompt_text"]
+        has_response = isinstance(turn.get("response_text"), str) and turn["response_text"]
+        if has_prompt and has_response:
+            continue
+        next_turn = turns[i + 1] if i + 1 < len(turns) else None
+        instruction, response = _derive_instruction_response_pair(
+            turn, next_turn,
+        )
+        if not has_prompt and instruction:
+            turn["prompt_text"] = instruction
+        if not has_response and response:
+            turn["response_text"] = response
+
+
 async def _attach_lazy_prm_scores(
     llm: AsyncLLMClient, session: dict,
 ) -> None:
@@ -602,6 +643,14 @@ async def summarize_sessions_parallel(
     """
     if not sessions:
         return []
+
+    # Backfill flat ``prompt_text`` / ``response_text`` for turns
+    # captured from the in-process CoPaw hook (which only emits
+    # ``messages``).  Cheap and synchronous — must run before lazy
+    # PRM (which currently re-derives the same pair) and before
+    # ``_build_replay_cases`` reads them.
+    for session in sessions:
+        _attach_flat_turn_text(session)
 
     # Phase 2: backfill PRM scores for turns ingested without one.
     # Runs in parallel across sessions (each session's turns are
