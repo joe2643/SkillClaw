@@ -592,6 +592,64 @@ def create_dashboard_app(config: SkillClawConfig) -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.delete("/api/v1/skills/{skill_id}")
+    async def delete_skill_endpoint(
+        skill_id: str,
+        also_copaw: bool = False,
+    ):
+        """Remove a skill from every store SkillClaw knows about.
+
+        Five-step purge that maps to the ``skillclaw skills delete`` CLI:
+        client cache + remote object + manifest + registry, plus
+        optional CoPaw workspace overrides via ``?also_copaw=1``.
+        """
+        try:
+            skill = service.store.get_skill(skill_id)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=404, detail=f"skill not found: {exc}",
+            ) from exc
+        name = (skill or {}).get("name", "")
+        if not name:
+            raise HTTPException(
+                status_code=404, detail=f"skill_id {skill_id} has no name",
+            )
+
+        try:
+            from .config_store import ConfigStore
+            from .skill_hub import SkillHub
+            cs = ConfigStore()
+            cfg = cs.to_skillclaw_config()
+            hub = SkillHub.from_config(cfg)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"failed to construct SkillHub: {exc}",
+            ) from exc
+
+        downstream = (
+            ["~/.copaw/workspaces/*/skills"] if also_copaw else []
+        )
+        try:
+            result = hub.delete_skill(
+                skill_name=name,
+                skills_dir=cfg.skills_dir,
+                downstream_dirs=downstream,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=500, detail=f"delete failed: {exc}",
+            ) from exc
+
+        # Refresh the dashboard snapshot so the UI immediately drops
+        # the deleted entry.
+        try:
+            service.sync()
+        except Exception:
+            pass
+
+        return result
+
     @app.get("/api/v1/sessions")
     async def list_sessions(
         skill_id: str = "",

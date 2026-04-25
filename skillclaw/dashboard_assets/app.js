@@ -1430,6 +1430,16 @@ function renderLocalSkillDetail(skill) {
             ${badge(skill.has_remote ? l("本地和共享库都有", "Local + Shared") : l("仅本地", "Local Only"), "neutral")}
           </div>
         </div>
+        <div class="action-row">
+          <button class="ghost danger" type="button"
+                  data-delete-skill="${escapeHtml(skill.skill_id)}"
+                  data-delete-skill-name="${escapeHtml(skill.name || "")}">
+            ${escapeHtml(l("删除此技能", "Delete this skill"))}
+          </button>
+          <span class="soft-copy" style="margin-left:8px">
+            ${escapeHtml(l("会从客户端缓存、共享池、manifest、registry 同 CoPaw workspace overrides 全部清走。", "Removes from client cache, shared pool, manifest, registry, and CoPaw workspace overrides."))}
+          </span>
+        </div>
         <div class="mini-grid">
         ${renderMiniCard(l("当前状态", "Current Status"), sync.label, l("本地内容和共享正式版现在是什么关系。", "How the local content relates to the shared official version."))}
         ${renderMiniCard(l("共享正式版", "Shared Official Version"), sharedVersionLabel(skill), skill.has_remote ? l("共享库当前正式版本。", "Current official version in the shared pool.") : l("这个技能还没有进入共享库。", "This skill has not entered the shared pool yet."))}
@@ -2435,6 +2445,39 @@ function renderTurnCard(turn) {
   `
 }
 
+async function deleteSkillFlow(skillId, displayName) {
+  if (state.loading) {
+    return
+  }
+  const prompt = l(
+    `确认删除技能 "${displayName}"？\n\n会从客户端缓存、共享池、manifest、registry，以及所有 CoPaw workspace 嘅 per-agent override 全部清走。此操作不可撤销。`,
+    `Delete skill "${displayName}"?\n\nRemoves from client cache, shared pool, manifest, registry, and per-agent overrides under all CoPaw workspaces. This cannot be undone.`,
+  )
+  if (!window.confirm(prompt)) {
+    return
+  }
+  setLoading(true)
+  try {
+    const url = `/api/v1/skills/${encodeURIComponent(skillId)}?also_copaw=true`
+    const result = await getJson(url, { method: "DELETE" })
+    const downstreamCount = (result.downstream_removed || []).length
+    showMessage(
+      "success",
+      l(
+        `已删除 "${displayName}"：客户端 ${result.client_cache_removed ? "✓" : "—"}，共享池 ${result.remote_skill_removed ? "✓" : "—"}，CoPaw overrides ${downstreamCount} 个。`,
+        `Deleted "${displayName}": client ${result.client_cache_removed ? "✓" : "—"}, shared ${result.remote_skill_removed ? "✓" : "—"}, ${downstreamCount} CoPaw override(s).`,
+      ),
+    )
+    state.selectedLocalSkillId = ""
+    state.selectedFinalSkillId = ""
+    await refreshData()
+  } catch (error) {
+    showMessage("error", error.message || l("删除失败", "Delete failed"))
+  } finally {
+    setLoading(false)
+  }
+}
+
 async function runOperation(op) {
   if (state.loading) {
     return
@@ -2542,9 +2585,17 @@ async function handleDocumentClick(event) {
     return
   }
   const target = origin.closest(
-    "button, [data-select-local-skill], [data-select-final-skill], [data-select-candidate], [data-select-session], [data-view]"
+    "button, [data-select-local-skill], [data-select-final-skill], [data-select-candidate], [data-select-session], [data-view], [data-delete-skill]"
   )
   if (!(target instanceof HTMLElement)) {
+    return
+  }
+
+  if (target.dataset.deleteSkill) {
+    await deleteSkillFlow(
+      target.dataset.deleteSkill,
+      target.dataset.deleteSkillName || target.dataset.deleteSkill,
+    )
     return
   }
 

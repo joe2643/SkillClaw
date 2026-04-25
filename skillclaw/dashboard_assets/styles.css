@@ -112,6 +112,16 @@ button.ghost {
   color: var(--blue);
 }
 
+button.ghost.danger {
+  color: #c0392b;
+  border-color: #f5b7b1;
+}
+
+button.ghost.danger:hover:not(:disabled) {
+  background: #fff5f3;
+  border-color: #e74c3c;
+}
+
 input,
 select,
 textarea {
