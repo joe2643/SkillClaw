@@ -55,9 +55,11 @@ import os
 import re
 import time
 from collections import Counter
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import yaml
+
+from .skill_bundle import list_skill_bundle_paths
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +101,7 @@ def _parse_skill_md(path: str) -> Optional[Dict[str, Any]]:
         return None
 
     fm_text = raw[3:end_idx].strip()
-    body = raw[end_idx + 4:].strip()
+    body = raw[end_idx + 4 :].strip()
 
     try:
         fm = yaml.safe_load(fm_text) or {}
@@ -152,6 +154,7 @@ def _parse_skill_md(path: str) -> Optional[Dict[str, Any]]:
 # SkillManager                                                         #
 # ------------------------------------------------------------------ #
 
+
 class SkillManager:
     """Loads skills from a directory of AgentSkills / OpenClaw compatible
     skill folders.
@@ -173,9 +176,7 @@ class SkillManager:
         embedding_model_path: Optional[str] = None,
     ):
         if retrieval_mode not in ("template", "embedding"):
-            raise ValueError(
-                f"retrieval_mode must be 'template' or 'embedding', got '{retrieval_mode}'"
-            )
+            raise ValueError(f"retrieval_mode must be 'template' or 'embedding', got '{retrieval_mode}'")
         if not os.path.isdir(skills_dir):
             raise FileNotFoundError(f"Skills directory not found: {skills_dir}")
 
@@ -244,11 +245,17 @@ class SkillManager:
         """Record that these skills were injected into a request."""
         now = time.strftime("%Y-%m-%dT%H:%M:%S")
         for name in skill_names:
-            entry = self._stats.setdefault(name, {
-                "inject_count": 0, "positive_count": 0,
-                "negative_count": 0, "neutral_count": 0,
-                "last_injected_at": "", "effectiveness": 0.5,
-            })
+            entry = self._stats.setdefault(
+                name,
+                {
+                    "inject_count": 0,
+                    "positive_count": 0,
+                    "negative_count": 0,
+                    "neutral_count": 0,
+                    "last_injected_at": "",
+                    "effectiveness": 0.5,
+                },
+            )
             entry["inject_count"] += 1
             entry["last_injected_at"] = now
         self._maybe_flush_stats()
@@ -516,25 +523,34 @@ class SkillManager:
         are filtered out (matching OpenClaw behaviour).
         """
         return [
-            s for s in self.skills.get("all_skills", [])
-            if not s.get("_extra_frontmatter", {}).get(
-                "disable-model-invocation", False
-            )
+            s
+            for s in self.skills.get("all_skills", [])
+            if not s.get("_extra_frontmatter", {}).get("disable-model-invocation", False)
         ]
 
     def get_skill_path_map(self) -> Dict[str, Dict[str, str]]:
-        """Return a mapping from file_path → {skill_id, skill_name}.
+        """Return a mapping from bundle file path → {skill_id, skill_name}.
 
         Used by the server to resolve which skill a ``read`` tool call targets.
         """
         path_map: Dict[str, Dict[str, str]] = {}
         for s in self.get_all_skills():
-            for fp in [s.get("file_path", ""), self._public_skill_path(s)]:
-                if fp:
-                    path_map[fp] = {
-                        "skill_id": s.get("id", ""),
-                        "skill_name": s.get("name", ""),
-                    }
+            skill_dir = os.path.dirname(str(s.get("file_path", "") or ""))
+            bundle_paths = list_skill_bundle_paths(skill_dir) if skill_dir else []
+            bundle_paths = bundle_paths or ["SKILL.md"]
+            public_dir = os.path.dirname(self._public_skill_path(s)) if self._public_skill_path(s) else ""
+            for rel_path in bundle_paths:
+                locations = []
+                if skill_dir:
+                    locations.append(os.path.realpath(os.path.join(skill_dir, rel_path)))
+                if public_dir:
+                    locations.append(os.path.realpath(os.path.join(public_dir, rel_path)))
+                for fp in locations:
+                    if fp:
+                        path_map[fp] = {
+                            "skill_id": s.get("id", ""),
+                            "skill_name": s.get("name", ""),
+                        }
         return path_map
 
     def _public_skill_path(self, skill: dict) -> str:
@@ -549,8 +565,7 @@ class SkillManager:
     def _escape_xml(text: str) -> str:
         """Escape XML special characters (matching OpenClaw's escapeXml)."""
         return (
-            text
-            .replace("&", "&amp;")
+            text.replace("&", "&amp;")
             .replace("<", "&lt;")
             .replace(">", "&gt;")
             .replace('"', "&quot;")
@@ -618,7 +633,8 @@ class SkillManager:
 
     @staticmethod
     def build_skills_section(
-        skills_prompt: str, read_tool_name: str = "read",
+        skills_prompt: str,
+        read_tool_name: str = "read",
     ) -> str:
         """Wrap a skills catalog string with the ``## Skills (mandatory)``
         instruction block.
@@ -628,20 +644,22 @@ class SkillManager:
         trimmed = skills_prompt.strip()
         if not trimmed:
             return ""
-        return "\n".join([
-            "## Skills (mandatory)",
-            "Before replying: scan <available_skills> <description> entries.",
-            f"- If exactly one skill clearly applies: read its SKILL.md at "
-            f"<location> with `{read_tool_name}`, then follow it.",
-            "- If multiple could apply: choose the most specific one, then read/follow it.",
-            "- If none clearly apply: do not read any SKILL.md.",
-            "Constraints: never read more than one skill up front; only read after selecting.",
-            "- When a skill drives external API writes, assume rate limits: prefer fewer "
-            "larger writes, avoid tight one-item loops, serialize bursts when possible, "
-            "and respect 429/Retry-After.",
-            trimmed,
-            "",
-        ])
+        return "\n".join(
+            [
+                "## Skills (mandatory)",
+                "Before replying: scan <available_skills> <description> entries.",
+                f"- If exactly one skill clearly applies: read its SKILL.md at "
+                f"<location> with `{read_tool_name}`, then follow it.",
+                "- If multiple could apply: choose the most specific one, then read/follow it.",
+                "- If none clearly apply: do not read any SKILL.md.",
+                "Constraints: never read more than one skill up front; only read after selecting.",
+                "- When a skill drives external API writes, assume rate limits: prefer fewer "
+                "larger writes, avoid tight one-item loops, serialize bursts when possible, "
+                "and respect 429/Retry-After.",
+                trimmed,
+                "",
+            ]
+        )
 
     def build_injection_prompt(
         self,
@@ -666,10 +684,7 @@ class SkillManager:
 
     def _remove_skill_from_memory(self, name: str) -> None:
         """Remove a skill from in-memory structures (not from disk)."""
-        self.skills["all_skills"] = [
-            s for s in self.skills.get("all_skills", [])
-            if s.get("name") != name
-        ]
+        self.skills["all_skills"] = [s for s in self.skills.get("all_skills", []) if s.get("name") != name]
 
     def add_skill(self, skill: dict) -> bool:
         """
@@ -696,8 +711,7 @@ class SkillManager:
                 logger.info("[SkillManager] skipping duplicate skill: %s", name)
                 return False
 
-        clean_skill = {k: v for k, v in skill.items()
-                       if not k.startswith("_") or k == "_extra_frontmatter"}
+        clean_skill = {k: v for k, v in skill.items() if not k.startswith("_") or k == "_extra_frontmatter"}
         if "id" not in clean_skill:
             clean_skill["id"] = hashlib.sha256(name.encode()).hexdigest()[:12]
         if "file_path" not in clean_skill:
@@ -754,14 +768,9 @@ class SkillManager:
 
         lines.append(f"name: {name}")
 
-        needs_quoting = any(c in description for c in ':{}[],"\'#&*!|>%@`\n')
+        needs_quoting = any(c in description for c in ":{}[],\"'#&*!|>%@`\n")
         if needs_quoting:
-            escaped = (
-                description
-                .replace("\\", "\\\\")
-                .replace('"', '\\"')
-                .replace("\n", "\\n")
-            )
+            escaped = description.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
             lines.append(f'description: "{escaped}"')
         else:
             lines.append(f"description: {description}")
@@ -771,8 +780,10 @@ class SkillManager:
             if key.startswith("_"):
                 continue
             dumped = yaml.dump(
-                {key: value}, default_flow_style=False,
-                allow_unicode=True, width=10000,
+                {key: value},
+                default_flow_style=False,
+                allow_unicode=True,
+                width=10000,
             ).strip()
             lines.append(dumped)
 
@@ -842,17 +853,10 @@ class SkillManager:
         logger.info("[SkillManager] saved %d skills to %s", len(all_skills), self._skills_dir)
 
     def _get_all_skill_names(self) -> set:
-        return {
-            str(s.get("name"))
-            for s in self.skills.get("all_skills", [])
-            if s.get("name")
-        }
+        return {str(s.get("name")) for s in self.skills.get("all_skills", []) if s.get("name")}
 
     def _category_counts(self) -> Counter:
-        return Counter(
-            str(s.get("category") or "general")
-            for s in self.skills.get("all_skills", [])
-        )
+        return Counter(str(s.get("category") or "general") for s in self.skills.get("all_skills", []))
 
     def get_skill_count(self) -> dict:
         return {

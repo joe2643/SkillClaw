@@ -80,6 +80,15 @@ _DEFAULTS: dict = {
         "max_jobs_per_day": 5,
         "max_concurrency": 1,
     },
+    "dashboard": {
+        "enabled": False,
+        "host": "127.0.0.1",
+        "port": 3788,
+        "db_path": str(CONFIG_DIR / "dashboard.db"),
+        "sync_on_start": True,
+        "include_shared": True,
+        "evolve_server_url": "",
+    },
 }
 
 
@@ -202,6 +211,7 @@ class ConfigStore:
             return _deep_merge({}, _DEFAULTS)
         try:
             import yaml
+
             with open(self.config_file, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f) or {}
             return _deep_merge(_DEFAULTS, data)
@@ -210,6 +220,7 @@ class ConfigStore:
 
     def save(self, data: dict):
         import yaml
+
         self.config_file.parent.mkdir(parents=True, exist_ok=True)
         with open(self.config_file, "w", encoding="utf-8") as f:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
@@ -242,6 +253,7 @@ class ConfigStore:
         llm_api_base = llm.get("api_base", "")
         llm_api_key = llm.get("api_key", "")
         llm_model_id = llm.get("model_id", "")
+        llm_api_mode = str(llm.get("api_mode", "chat") or "chat")
         proxy = data.get("proxy", {})
         skills = data.get("skills", {})
         orouter = data.get("openrouter", {})
@@ -253,6 +265,7 @@ class ConfigStore:
 
         sharing = data.get("sharing", {})
         validation = data.get("validation", {})
+        dashboard = data.get("dashboard", {})
         sharing_backend = _infer_sharing_backend(sharing)
         sharing_endpoint = _first_non_empty(sharing, "endpoint")
         sharing_bucket = _first_non_empty(sharing, "bucket")
@@ -279,6 +292,7 @@ class ConfigStore:
             llm_api_key=llm_api_key,
             llm_model_id=llm_model_id,
             llm_passthrough_model=bool(llm.get("passthrough_model", False)),
+            llm_api_mode=llm_api_mode,
             bedrock_region=llm.get("bedrock_region") or data.get("bedrock_region", "us-east-1"),
             # OpenRouter
             openrouter_app_name=orouter.get("app_name", "SkillClaw"),
@@ -291,8 +305,7 @@ class ConfigStore:
             proxy_host=proxy.get("host", "0.0.0.0"),
             proxy_api_key=str(proxy.get("api_key", "") or ""),
             served_model_name=(
-                _first_non_empty(proxy, "served_model_name")
-                or _default_served_model_name(llm_model_id)
+                _first_non_empty(proxy, "served_model_name") or _default_served_model_name(llm_model_id)
             ),
             # Record capture — pre-existing dataclass fields that
             # ``to_skillclaw_config`` previously didn't read, so the
@@ -348,6 +361,15 @@ class ConfigStore:
             validation_poll_interval_seconds=int(validation.get("poll_interval_seconds", 60)),
             validation_max_jobs_per_day=int(validation.get("max_jobs_per_day", 5)),
             validation_max_concurrency=max(1, int(validation.get("max_concurrency", 1))),
+            dashboard_enabled=bool(dashboard.get("enabled", False)),
+            dashboard_host=str(dashboard.get("host", "127.0.0.1") or "127.0.0.1"),
+            dashboard_port=int(dashboard.get("port", 3788) or 3788),
+            dashboard_db_path=str(
+                dashboard.get("db_path", str(CONFIG_DIR / "dashboard.db")) or str(CONFIG_DIR / "dashboard.db")
+            ),
+            dashboard_sync_on_start=bool(dashboard.get("sync_on_start", True)),
+            dashboard_include_shared=bool(dashboard.get("include_shared", True)),
+            dashboard_evolve_server_url=str(dashboard.get("evolve_server_url", "") or ""),
         )
 
     def describe(self) -> str:
@@ -356,6 +378,7 @@ class ConfigStore:
         llm = data.get("llm", {})
         skills = data.get("skills", {})
         prm = data.get("prm", {})
+        dashboard = data.get("dashboard", {})
         claw_type = str(data.get("claw_type", "openclaw") or "openclaw")
         effective_skills_dir = resolve_skills_dir(
             skills.get("dir", str(_DEFAULT_SKILLS_DIR)),
@@ -366,12 +389,20 @@ class ConfigStore:
             f"llm.provider:    {llm.get('provider', '?')}",
             f"llm.model_id:    {llm.get('model_id', '?')}",
             f"llm.api_base:    {llm.get('api_base', '—') if llm.get('provider') != 'bedrock' else '(n/a)'}",
-            *([ f"llm.bedrock_region: {llm.get('bedrock_region', 'us-east-1')}" ] if llm.get('provider') == 'bedrock' else []),
-            *([
-                f"openrouter.route:    {data.get('openrouter', {}).get('route', 'fallback')}",
-                f"openrouter.fallback: {data.get('openrouter', {}).get('fallback_models', '') or '(none)'}",
-                f"openrouter.data:     {data.get('openrouter', {}).get('data_policy', '') or 'allow'}",
-            ] if llm.get('provider') == 'openrouter' else []),
+            *(
+                [f"llm.bedrock_region: {llm.get('bedrock_region', 'us-east-1')}"]
+                if llm.get("provider") == "bedrock"
+                else []
+            ),
+            *(
+                [
+                    f"openrouter.route:    {data.get('openrouter', {}).get('route', 'fallback')}",
+                    f"openrouter.fallback: {data.get('openrouter', {}).get('fallback_models', '') or '(none)'}",
+                    f"openrouter.data:     {data.get('openrouter', {}).get('data_policy', '') or 'allow'}",
+                ]
+                if llm.get("provider") == "openrouter"
+                else []
+            ),
             f"proxy.port:      {data.get('proxy', {}).get('port', 30000)}",
             f"skills.enabled:  {skills.get('enabled', True)}",
             f"skills.dir:      {effective_skills_dir}",
@@ -382,7 +413,7 @@ class ConfigStore:
         if sharing.get("enabled"):
             backend = _infer_sharing_backend(sharing) or "unknown"
             lines += [
-                f"sharing.enabled: True",
+                "sharing.enabled: True",
                 f"sharing.backend: {backend}",
             ]
             if backend == "local":
@@ -400,11 +431,17 @@ class ConfigStore:
                 f"sharing.auto_pull: {sharing.get('auto_pull_on_start', False)}",
             ]
         else:
-            lines.append(f"sharing.enabled: False")
+            lines.append("sharing.enabled: False")
         lines += [
             f"validation.enabled: {validation.get('enabled', False)}",
             f"validation.mode: {_normalize_validation_mode(validation.get('mode', 'replay'))}",
             f"validation.idle_after: {validation.get('idle_after_seconds', 300)}",
             f"validation.poll_interval: {validation.get('poll_interval_seconds', 60)}",
+            f"dashboard.enabled: {dashboard.get('enabled', False)}",
+            f"dashboard.host: {dashboard.get('host', '127.0.0.1')}",
+            f"dashboard.port: {dashboard.get('port', 3788)}",
+            f"dashboard.db_path: {dashboard.get('db_path', str(CONFIG_DIR / 'dashboard.db'))}",
+            f"dashboard.include_shared: {dashboard.get('include_shared', True)}",
+            f"dashboard.evolve_server_url: {dashboard.get('evolve_server_url', '') or '(not set)'}",
         ]
         return "\n".join(lines)

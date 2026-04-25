@@ -53,8 +53,8 @@ class AsyncLLMClient:
         max_tokens: int = 100000,
         temperature: float = 0.4,
     ) -> None:
-        from openai import OpenAI
         import httpx
+        from openai import OpenAI
 
         self._client = OpenAI(
             api_key=api_key or os.environ.get("OPENAI_API_KEY", ""),
@@ -102,6 +102,7 @@ class AsyncLLMClient:
 
     async def _chat_via_stream(self, body: dict[str, Any]) -> str:
         import json
+
         import httpx
 
         headers: dict[str, str] = {}

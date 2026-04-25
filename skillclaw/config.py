@@ -64,6 +64,9 @@ class SkillClawConfig:
     llm_api_key: str = ""
     llm_model_id: str = ""
     llm_passthrough_model: bool = False
+    # Upstream API surface: "chat" keeps the legacy chat-completions bridge;
+    # "responses" forwards Codex /v1/responses payloads to an upstream Responses API.
+    llm_api_mode: str = "chat"
 
     # ------------------------------------------------------------------ #
     # OpenRouter-specific (ignored for other providers)                    #
@@ -102,6 +105,17 @@ class SkillClawConfig:
     validation_poll_interval_seconds: int = 60
     validation_max_jobs_per_day: int = 5
     validation_max_concurrency: int = 1
+
+    # ------------------------------------------------------------------ #
+    # Dashboard                                                           #
+    # ------------------------------------------------------------------ #
+    dashboard_enabled: bool = False
+    dashboard_host: str = "127.0.0.1"
+    dashboard_port: int = 3788
+    dashboard_db_path: str = "~/.skillclaw/dashboard.db"
+    dashboard_sync_on_start: bool = True
+    dashboard_include_shared: bool = True
+    dashboard_evolve_server_url: str = ""
 
     # ------------------------------------------------------------------ #
     # Cloud / Bedrock                                                      #

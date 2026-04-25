@@ -28,3 +28,6 @@ Thumbs.db
 SESSION-NOTES.md
 *.bak.*
 *.bak-*
+
+# uv
+uv.lock

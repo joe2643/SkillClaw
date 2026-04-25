@@ -15,30 +15,37 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from skillclaw.object_store import build_object_store
+from skillclaw.skill_bundle import (
+    bundle_entrypoint_bytes,
+    bundle_file_records,
+    bundle_tree_sha256,
+)
+
+from ..core.config import EvolveServerConfig
 from ..core.constants import SLUG_RE
 from ..core.llm_client import AsyncLLMClient
-from ..storage.mock_bucket import LocalBucket
-from ..storage.oss_helpers import (
-    delete_session_keys,
-    fetch_skill_content,
-    list_session_keys,
-    load_manifest,
-    read_json_object,
-    save_manifest,
-)
 from ..core.skill_registry import SkillIDRegistry
+from ..core.utils import build_skill_md
 from ..pipeline.summarizer import (
     _extract_session_metadata,
     build_session_trajectory,
     summarize_sessions_parallel,
 )
-from ..core.utils import build_skill_md
-from skillclaw.object_store import build_object_store
-
-from .agents_md import load_agents_md
-from ..core.config import EvolveServerConfig
-from .openclaw_runner import OpenClawRunner
+from ..storage.mock_bucket import LocalBucket
+from ..storage.oss_helpers import (
+    delete_session_keys,
+    fetch_skill_bundle,
+    list_object_keys,
+    list_session_keys,
+    load_manifest,
+    read_json_object,
+    save_manifest,
+    save_version_bundle,
+)
 from .agent_workspace import AgentWorkspace
+from .agents_md import load_agents_md
+from .openclaw_runner import OpenClawRunner
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +130,7 @@ class _AnthropicMessagesLLMClient:
                     return "".join(parts)
                 except Exception:
                     if attempt < max_retries - 1:
-                        wait = min(2 ** attempt + random.uniform(0, 1), 30)
+                        wait = min(2**attempt + random.uniform(0, 1), 30)
                         await asyncio.sleep(wait)
                         continue
                     raise
@@ -264,46 +271,83 @@ class AgentEvolveServer:
                 consumed_keys.append(key)
         logger.info(
             "[AgentEvolveServer] drained %d session(s) (%d keys found)",
-            len(sessions), len(keys),
+            len(sessions),
+            len(keys),
         )
         return sessions, consumed_keys
 
     def _load_remote_skills(self) -> dict[str, dict[str, Any]]:
         return load_manifest(self._bucket, self._prefix)
 
-    def _fetch_all_skills(self, manifest: dict[str, dict]) -> dict[str, str]:
-        """Fetch SKILL.md content for all skills in the manifest."""
-        skills: dict[str, str] = {}
-        for name in manifest:
-            content = fetch_skill_content(self._bucket, self._prefix, name)
-            if content:
-                skills[name] = content
+    def _fetch_all_skills(self, manifest: dict[str, dict]) -> dict[str, dict[str, bytes]]:
+        """Fetch full bundle content for all skills in the manifest."""
+        skills: dict[str, dict[str, bytes]] = {}
+        for name, record in manifest.items():
+            bundle = fetch_skill_bundle(self._bucket, self._prefix, name, record)
+            if bundle:
+                skills[name] = bundle
         return skills
 
     # ================================================================= #
     #  Upload evolved skills                                             #
     # ================================================================= #
 
-    def _upload_skill(self, skill: dict, action: str = "create") -> None:
+    def _upload_skill(
+        self,
+        skill: dict,
+        bundle_files: dict[str, bytes],
+        action: str = "create",
+    ) -> None:
         name = skill.get("name", "")
         if not name:
             return
 
         skill_id = self._id_registry.get_or_create(name)
-        md_content = build_skill_md(skill)
+        if "SKILL.md" not in bundle_files:
+            bundle_files = {**bundle_files, "SKILL.md": build_skill_md(skill).encode("utf-8")}
+        md_bytes = bundle_entrypoint_bytes(bundle_files)
         object_key = f"{self._prefix}skills/{name}/SKILL.md"
 
-        self._bucket.put_object(object_key, md_content.encode("utf-8"))
+        self._bucket.put_object(object_key, md_bytes)
+        keep_bundle_keys: set[str] = set()
+        for rel_path, data in sorted(bundle_files.items()):
+            if rel_path == "SKILL.md":
+                continue
+            key = f"{self._prefix}skills/{name}/files/{rel_path}"
+            keep_bundle_keys.add(key)
+            self._bucket.put_object(key, data)
 
-        content_sha = hashlib.sha256(md_content.encode("utf-8")).hexdigest()
-        version = self._id_registry.record_update(name, content_sha, action=action)
+        for key in list_object_keys(self._bucket, f"{self._prefix}skills/{name}/files/"):
+            if key not in keep_bundle_keys:
+                self._bucket.delete_object(key)
+
+        content_sha = hashlib.sha256(md_bytes).hexdigest()
+        tree_sha = bundle_tree_sha256(bundle_files)
+        bundle_record = {
+            "format": "bundle_v1",
+            "entrypoint": "SKILL.md",
+            "tree_sha256": tree_sha,
+            "files": bundle_file_records(bundle_files),
+        }
+        version = self._id_registry.record_update(
+            name,
+            content_sha,
+            action=action,
+            bundle_record=bundle_record,
+        )
+        save_version_bundle(self._bucket, self._prefix, name, version, bundle_files)
 
         manifest = self._load_remote_skills()
         manifest[name] = {
+            **manifest.get(name, {}),
             "name": name,
             "skill_id": skill_id,
             "version": version,
             "sha256": content_sha,
+            "tree_sha256": tree_sha,
+            "format": "bundle_v1",
+            "entrypoint": "SKILL.md",
+            "files": bundle_record["files"],
             "uploaded_by": "evolve_server",
             "uploaded_at": datetime.now(timezone.utc).isoformat(),
             "description": skill.get("description", ""),
@@ -312,7 +356,10 @@ class AgentEvolveServer:
         save_manifest(self._bucket, self._prefix, manifest)
         logger.info(
             "[AgentEvolveServer] uploaded skill %s (id=%s, v%d) to %s",
-            name, skill_id, version, object_key,
+            name,
+            skill_id,
+            version,
+            object_key,
         )
 
     # ================================================================= #
@@ -338,7 +385,9 @@ class AgentEvolveServer:
         if not sessions:
             logger.info("[AgentEvolveServer] queue empty — nothing to process")
             return {
-                "sessions": 0, "skills_evolved": 0, "agent_returncode": None,
+                "sessions": 0,
+                "skills_evolved": 0,
+                "agent_returncode": None,
             }
 
         # ---- 1.5. summarize sessions -------------------------------- #
@@ -350,7 +399,8 @@ class AgentEvolveServer:
         #  the agent well within the context-window budget.
         await self._summarize_sessions(sessions)
         logger.info(
-            "[AgentEvolveServer] summarized %d session(s)", len(sessions),
+            "[AgentEvolveServer] summarized %d session(s)",
+            len(sessions),
         )
 
         # ---- 2. prepare workspace ------------------------------------ #
@@ -405,23 +455,34 @@ class AgentEvolveServer:
             skill["name"] = name
 
             try:
-                await self._call_storage(self._upload_skill, skill, action)
+                await self._call_storage(
+                    self._upload_skill,
+                    skill,
+                    change.get("bundle_files", {}),
+                    action,
+                )
                 skills_evolved += 1
-                evolution_records.append({
-                    "action": action,
-                    "skill_name": name,
-                    "skill_id": self._id_registry.get_or_create(name),
-                    "version": self._id_registry.get_version(name),
-                    "source": "agent",
-                })
+                evolution_records.append(
+                    {
+                        "action": action,
+                        "skill_name": name,
+                        "skill_id": self._id_registry.get_or_create(name),
+                        "version": self._id_registry.get_version(name),
+                        "source": "agent",
+                    }
+                )
             except Exception as e:
                 logger.error(
-                    "[AgentEvolveServer] failed to upload skill '%s': %s", name, e,
+                    "[AgentEvolveServer] failed to upload skill '%s': %s",
+                    name,
+                    e,
                 )
 
         # ---- 7. finalize + ack --------------------------------------- #
         await self._call_storage(
-            self._id_registry.save_to_oss, self._bucket, self._prefix,
+            self._id_registry.save_to_oss,
+            self._bucket,
+            self._prefix,
         )
         await self._call_storage(delete_session_keys, self._bucket, session_keys)
 
@@ -438,9 +499,11 @@ class AgentEvolveServer:
         }
         self._append_history(summary)
         logger.info(
-            "[AgentEvolveServer] === cycle done: %d sessions, %d skills evolved "
-            "in %.1fs (agent exit=%d) ===",
-            len(sessions), skills_evolved, elapsed, result.returncode,
+            "[AgentEvolveServer] === cycle done: %d sessions, %d skills evolved in %.1fs (agent exit=%d) ===",
+            len(sessions),
+            skills_evolved,
+            elapsed,
+            result.returncode,
         )
         return summary
 
@@ -503,15 +566,19 @@ class AgentEvolveServer:
                 for name, e in entries.items()
             }
             pending_keys = await self._call_storage(
-                list_session_keys, self._bucket, self._prefix,
+                list_session_keys,
+                self._bucket,
+                self._prefix,
             )
-            return JSONResponse(content={
-                "running": self._running,
-                "pending_sessions": len(pending_keys),
-                "registered_skills": len(entries),
-                "skills": skill_summary,
-                "fresh_mode": self.config.fresh,
-            })
+            return JSONResponse(
+                content={
+                    "running": self._running,
+                    "pending_sessions": len(pending_keys),
+                    "registered_skills": len(entries),
+                    "skills": skill_summary,
+                    "fresh_mode": self.config.fresh,
+                }
+            )
 
         @app.get("/health")
         async def health():
