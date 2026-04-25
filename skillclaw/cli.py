@@ -929,5 +929,82 @@ def skills_delete(name: str, force: bool, also_copaw: bool):
             click.echo(f"  ! {e}")
 
 
+@skills.command(name="find-duplicates")
+@click.option(
+    "--threshold", type=float, default=0.85, show_default=True,
+    help="Cosine similarity at or above which a pair is reported.",
+)
+@click.option(
+    "--embed-url", default="http://localhost:9876/v1", show_default=True,
+    help="OpenAI-compat embeddings endpoint base URL.",
+)
+@click.option(
+    "--embed-model", default="bge-m3", show_default=True,
+    help="Embedding model id served by --embed-url.",
+)
+@click.option(
+    "--embed-api-key", default="", envvar="SKILLCLAW_EMBED_API_KEY",
+    help="API key for the embeddings endpoint (env: SKILLCLAW_EMBED_API_KEY).",
+)
+def skills_find_duplicates(
+    threshold: float, embed_url: str, embed_model: str, embed_api_key: str,
+):
+    """Surface near-duplicate skills using embedding cosine similarity.
+
+    Defaults to a local ``bge-m3`` instance on localhost:9876 (the
+    same one CoPaw uses for memory search).  Embeds each
+    ``<skills_dir>/<name>/SKILL.md`` once, computes pairwise cosine,
+    and prints pairs at or above ``--threshold`` sorted highest-first.
+
+    This is detection only — no skill is modified.  To resolve a
+    duplicate pair, inspect the SKILL.md files and run
+    ``skillclaw skills delete <loser>`` on the one you want to drop.
+    """
+    from .skill_dedup import (
+        find_near_duplicates,
+        gather_skill_corpus,
+        make_http_embed_fn,
+    )
+
+    cs = ConfigStore()
+    cfg = cs.to_skillclaw_config()
+
+    corpus = gather_skill_corpus(cfg.skills_dir)
+    if not corpus:
+        click.echo(f"No SKILL.md files found under {cfg.skills_dir}.")
+        return
+
+    click.echo(
+        f"Embedding {len(corpus)} skill(s) via {embed_url} ({embed_model})..."
+    )
+    embed_fn = make_http_embed_fn(
+        base_url=embed_url,
+        model=embed_model,
+        api_key=embed_api_key,
+    )
+    pairs = find_near_duplicates(
+        corpus, embed_fn=embed_fn, threshold=threshold,
+    )
+    if not pairs:
+        click.echo(
+            f"No duplicate pairs at threshold {threshold:.2f} "
+            f"across {len(corpus)} skill(s)."
+        )
+        return
+
+    click.echo(
+        f"\nFound {len(pairs)} duplicate pair(s) at threshold "
+        f"{threshold:.2f} (highest similarity first):\n"
+    )
+    for pair in pairs:
+        click.echo(
+            f"  {pair.similarity:.4f}  {pair.skill_a}  ⟷  {pair.skill_b}"
+        )
+    click.echo(
+        "\nResolve by running ``skillclaw skills delete <name>`` "
+        "on whichever skill you want to drop."
+    )
+
+
 if __name__ == "__main__":
     skillclaw()

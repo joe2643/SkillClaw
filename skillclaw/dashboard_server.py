@@ -430,9 +430,14 @@ class DashboardService:
             "result": result_payload,
         }
 
-        if auto_finalize and str(self.config.dashboard_evolve_server_url or "").strip():
-            response["finalize"] = await self.trigger_evolve()
-            return response
+        if auto_finalize:
+            try:
+                response["finalize"] = await self.trigger_evolve()
+                return response
+            except ValueError:
+                # Sharing disabled or no embedded fallback — fall through
+                # to sync-only so the result still gets persisted.
+                pass
 
         sync_result = self.sync()
         response["sync"] = sync_result["summary"]
