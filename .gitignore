@@ -23,3 +23,8 @@ Thumbs.db
 # Environment
 .env
 *.env.local
+
+# Local-only ops notes (per-host run state, decisions, follow-ups)
+SESSION-NOTES.md
+*.bak.*
+*.bak-*
