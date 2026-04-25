@@ -1427,7 +1427,13 @@ class SkillClawAPIServer:
 
         self._served_model = config.served_model_name
         self._expected_api_key = config.proxy_api_key
-        os.makedirs(config.record_dir, exist_ok=True)
+        # Mirror the abspath/expanduser normalisation done below for
+        # ``self._record_file`` so the system-prompt cache also lands
+        # alongside the configured location, not in CWD.
+        _record_dir_abs = os.path.abspath(
+            os.path.expanduser(config.record_dir),
+        )
+        os.makedirs(_record_dir_abs, exist_ok=True)
         # System prompt compression is only used for OpenClaw (whose verbose
         # system prompt benefits from compression).  Non-OpenClaw agents send
         # short/no system prompts, and the compressed OpenClaw text can trigger
@@ -1435,7 +1441,7 @@ class SkillClawAPIServer:
         self._compress_system_prompt = (config.claw_type == "openclaw")
         cache_suffix = f"{config.claw_type}_{config.llm_provider}"
         self._system_prompt_cache_file = os.path.join(
-            config.record_dir, f"system_prompt_cache_{cache_suffix}.json"
+            _record_dir_abs, f"system_prompt_cache_{cache_suffix}.json"
         )
 
         # State machines
@@ -1471,13 +1477,21 @@ class SkillClawAPIServer:
         _INACTIVITY_TIMEOUT = 300  # seconds — treat as new session after 5 min idle
         self._tui_inactivity_timeout = _INACTIVITY_TIMEOUT
 
-        # Record files
+        # Record files — resolve absolute path so the daemon writes
+        # to the user's configured location regardless of CWD at
+        # launch.  Belt-and-suspenders: the same normalisation also
+        # happens in ``config_store.to_skillclaw_config``, but doing it
+        # here too means a programmatically-built ``SkillClawConfig``
+        # with a relative ``record_dir`` still lands in a sane place.
         self._record_file = ""
         self._prm_record_file = ""
         if config.record_enabled:
-            os.makedirs(config.record_dir, exist_ok=True)
-            self._record_file = os.path.join(config.record_dir, "conversations.jsonl")
-            self._prm_record_file = os.path.join(config.record_dir, "prm_scores.jsonl")
+            record_dir = os.path.abspath(
+                os.path.expanduser(config.record_dir),
+            )
+            os.makedirs(record_dir, exist_ok=True)
+            self._record_file = os.path.join(record_dir, "conversations.jsonl")
+            self._prm_record_file = os.path.join(record_dir, "prm_scores.jsonl")
             with open(self._record_file, "w"):
                 pass
             with open(self._prm_record_file, "w"):

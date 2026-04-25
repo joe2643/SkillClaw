@@ -7,6 +7,7 @@ Reads/writes ~/.skillclaw/config.yaml and bridges to SkillClawConfig.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -293,6 +294,17 @@ class ConfigStore:
                 _first_non_empty(proxy, "served_model_name")
                 or _default_served_model_name(llm_model_id)
             ),
+            # Record capture — pre-existing dataclass fields that
+            # ``to_skillclaw_config`` previously didn't read, so the
+            # YAML's ``record_dir`` / ``record_enabled`` were silently
+            # dropped and the dataclass defaults (``"records/"``,
+            # relative) always won.  This made the daemon write into
+            # whatever directory it was launched from instead of the
+            # user's configured location.
+            record_enabled=bool(data.get("record_enabled", True)),
+            record_dir=os.path.abspath(os.path.expanduser(
+                str(data.get("record_dir", "records/") or "records/"),
+            )),
             # Skills
             use_skills=bool(skills.get("enabled", True)),
             skills_dir=skills_dir,
