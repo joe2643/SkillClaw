@@ -13,7 +13,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Any
+import re
+from typing import Any, Optional
 
 from ..core.llm_client import AsyncLLMClient
 from ..core.utils import compact_tool_calls, compact_tool_observations
@@ -350,14 +351,24 @@ def _extract_session_metadata(session: dict) -> None:
     """Extract skill references and compute aggregate metrics for a session.
 
     Attaches the following keys directly to the session dict:
-    - ``_skills_referenced``: set of skill names explicitly read or modified
-      by any interaction. Prompt-time injection alone is not treated as
-      evidence that the session actually used that skill.
+    - ``_skills_referenced``: set of skill names the session referenced.
+      Strong signal: explicit ``read_skills`` / ``modified_skills``.
+      Weak signal (fallback only): ``injected_skills`` — used when the
+      session has *zero* explicit read/modified entries.  This catches
+      CoPaw-ingest sessions where the LLM happily answers from the
+      prompt-injected skill content without ever calling
+      ``read_file`` on the SKILL.md, which would otherwise leak every
+      such session into the ``NO_SKILL_KEY`` bucket and starve
+      ``evolve_skill_from_sessions``.
+    - ``_skill_signal_strength``: ``"explicit"`` (read/modified) or
+      ``"injected"`` (fallback) so downstream consumers can weight
+      sessions accordingly.
     - ``_prm_scores``: list of all non-None PRM scores
     - ``_avg_prm``: mean PRM (or None if no scores)
     - ``_has_tool_errors``: True if any interaction had tool errors
     """
-    skills: set[str] = set()
+    explicit: set[str] = set()
+    injected: set[str] = set()
     prm_scores: list[float] = []
     has_tool_errors = False
 
@@ -365,18 +376,27 @@ def _extract_session_metadata(session: dict) -> None:
         for item in turn.get("read_skills") or []:
             name = item.get("skill_name", "").strip() if isinstance(item, dict) else str(item or "").strip()
             if name:
-                skills.add(name)
+                explicit.add(name)
         for item in turn.get("modified_skills") or []:
             name = item.get("skill_name", "").strip() if isinstance(item, dict) else str(item or "").strip()
             if name:
-                skills.add(name)
+                explicit.add(name)
+        for item in turn.get("injected_skills") or []:
+            name = item.get("skill_name", "").strip() if isinstance(item, dict) else str(item or "").strip()
+            if name:
+                injected.add(name)
         prm = turn.get("prm_score")
         if prm is not None:
             prm_scores.append(prm)
         if turn.get("tool_errors"):
             has_tool_errors = True
 
-    session["_skills_referenced"] = skills
+    if explicit:
+        session["_skills_referenced"] = explicit
+        session["_skill_signal_strength"] = "explicit"
+    else:
+        session["_skills_referenced"] = injected
+        session["_skill_signal_strength"] = "injected" if injected else "none"
     session["_prm_scores"] = prm_scores
     session["_avg_prm"] = round(sum(prm_scores) / len(prm_scores), 3) if prm_scores else None
     session["_has_tool_errors"] = has_tool_errors
@@ -385,6 +405,159 @@ def _extract_session_metadata(session: dict) -> None:
 # ------------------------------------------------------------------ #
 #  Public API                                                          #
 # ------------------------------------------------------------------ #
+
+
+_PRM_JUDGE_SYSTEM = (
+    "You are a quality reviewer for conversational responses.\n"
+    "You will be shown a user instruction and the assistant response to that instruction.\n"
+    "Based on instruction alignment and task completion quality, decide whether the response was "
+    "helpful (+1), unhelpful (-1), or unclear (0).\n"
+    "Do NOT compare against any follow-up turn.\n"
+    "Only evaluate whether the response addresses the given instruction.\n"
+    "Use +1 when the response clearly follows and substantially completes the instruction.\n"
+    "Use -1 when the response is off-task, wrong, or fails to complete core requirements.\n"
+    "Use 0 when completion is ambiguous or evidence is insufficient.\n"
+    "Think briefly, then end your reply with exactly one of: Score: 1 / Score: -1 / Score: 0"
+)
+_PRM_SCORE_RE = re.compile(r"Score:\s*(-?[01])\b", re.IGNORECASE)
+
+
+def _content_text(msg: Any) -> str:
+    """Flatten a message ``content`` (str or list-of-blocks) to plain text."""
+    if not isinstance(msg, dict):
+        return ""
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts: list[str] = []
+        for blk in c:
+            if isinstance(blk, dict):
+                if blk.get("type") == "text":
+                    parts.append(str(blk.get("text", "")))
+                else:
+                    parts.append(str(blk))
+            else:
+                parts.append(str(blk))
+        return "".join(parts)
+    return ""
+
+
+def _last_role_msg(messages: list, role: str) -> Optional[dict]:
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == role:
+            return m
+    return None
+
+
+def _first_role_msg_after_index(messages: list, role: str, start: int) -> Optional[dict]:
+    for m in (messages or [])[start:]:
+        if isinstance(m, dict) and m.get("role") == role:
+            return m
+    return None
+
+
+def _derive_instruction_response_pair(
+    turn_record: dict,
+    next_turn_record: Optional[dict],
+) -> tuple[str, str]:
+    """Recover (instruction, response) for a CoPaw-ingest turn.
+
+    Each ingest record's ``messages`` is the snapshot fed INTO the LLM
+    for that turn — i.e. system + history + the user's instruction.
+    The LLM's response lands in the NEXT turn's ``messages`` as the
+    first new ``assistant`` message after the instruction.
+    """
+    msgs = turn_record.get("messages") or []
+    last_user = _last_role_msg(msgs, "user")
+    instruction = _content_text(last_user) if last_user else ""
+
+    response = ""
+    if next_turn_record is not None:
+        next_msgs = next_turn_record.get("messages") or []
+        # Find the index in next_msgs where our instruction lives, then
+        # look for the first assistant after it.  Falls back to the
+        # last assistant in next_msgs if instruction can't be matched
+        # (which can happen when memory compaction rewrites old turns).
+        idx = -1
+        if last_user is not None:
+            for i, m in enumerate(next_msgs):
+                if (
+                    isinstance(m, dict)
+                    and m.get("role") == "user"
+                    and _content_text(m) == instruction
+                ):
+                    idx = i + 1
+                    break
+        candidate = (
+            _first_role_msg_after_index(next_msgs, "assistant", idx)
+            if idx >= 0
+            else _last_role_msg(next_msgs, "assistant")
+        )
+        response = _content_text(candidate) if candidate else ""
+    return instruction.strip(), response.strip()
+
+
+async def _attach_lazy_prm_scores(
+    llm: AsyncLLMClient, session: dict,
+) -> None:
+    """Best-effort PRM scoring for turns that arrived without one.
+
+    Bridges the gap left by CoPaw's ``/v1/sessions/ingest`` path —
+    the proxy used to compute ``prm_score`` per turn before flushing,
+    but in-process CoPaw doesn't have a PRM scorer in the request
+    path.  We fill the gap here, after sessions have been drained
+    into the evolve queue.
+
+    Idempotent: turns that already have a valid score are skipped.
+    Best-effort: any failure (LLM error, malformed messages) leaves
+    the score as ``None`` so downstream code falls back to its
+    no-score branch.
+    """
+    turns = session.get("turns") or []
+    if not turns:
+        return
+    # Sort by turn_num so neighbour lookups are stable.
+    turns.sort(key=lambda t: int(t.get("turn_num") or 0))
+
+    for i, turn in enumerate(turns):
+        if turn.get("prm_score") is not None:
+            continue
+        next_turn = turns[i + 1] if i + 1 < len(turns) else None
+        instruction, response = _derive_instruction_response_pair(
+            turn, next_turn,
+        )
+        if not instruction or not response:
+            continue
+        msgs = [
+            {"role": "system", "content": _PRM_JUDGE_SYSTEM},
+            {
+                "role": "user",
+                "content": (
+                    f"Instruction:\n{instruction}\n\n"
+                    f"Response:\n{response}\n\n"
+                    "Was the response helpful for this instruction? "
+                    "End with Score: 1, Score: -1, or Score: 0."
+                ),
+            },
+        ]
+        try:
+            raw = await llm.chat(msgs, max_tokens=256, temperature=0.6)
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.debug(
+                "[PRM-lazy] score skipped for turn %s of session %s: %s",
+                turn.get("turn_num"), session.get("session_id"), e,
+            )
+            continue
+        m = _PRM_SCORE_RE.findall(raw or "")
+        if not m:
+            continue
+        try:
+            v = int(m[-1])
+        except ValueError:
+            continue
+        if v in (-1, 0, 1):
+            turn["prm_score"] = float(v)
 
 
 async def summarize_session(llm: AsyncLLMClient, session: dict) -> str:
@@ -418,14 +591,25 @@ async def summarize_sessions_parallel(
     """Preprocess and summarize all sessions in parallel.
 
     For each session:
-    1. Extract metadata (``_skills_referenced``, ``_avg_prm``, etc.)
-    2. Build programmatic ``_trajectory`` (lossless)
-    3. Generate ``_summary`` via LLM (trajectory-aware analysis)
+    1. Lazily fill missing ``prm_score`` per turn (CoPaw-ingest path
+       lacks the proxy's per-turn PRM, so we judge here using the same
+       LLM the rest of the pipeline already shares).
+    2. Extract metadata (``_skills_referenced``, ``_avg_prm``, etc.)
+    3. Build programmatic ``_trajectory`` (lossless)
+    4. Generate ``_summary`` via LLM (trajectory-aware analysis)
 
     Returns the list of summary strings (same order as *sessions*).
     """
     if not sessions:
         return []
+
+    # Phase 2: backfill PRM scores for turns ingested without one.
+    # Runs in parallel across sessions (each session's turns are
+    # scored serially to avoid burst-saturating the upstream).
+    await asyncio.gather(
+        *[_attach_lazy_prm_scores(llm, s) for s in sessions],
+        return_exceptions=True,
+    )
 
     for session in sessions:
         _extract_session_metadata(session)

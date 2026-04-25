@@ -1370,11 +1370,11 @@ class SkillClawAPIServer:
                 )
 
             target_path = owner._record_file
+            session_id = str(body.get("session_id"))
+            turn_num = int(body.get("turn") or 0)
             logger.info(
-                "[ingest] writing session=%s turn=%s to %s",
-                body.get("session_id"),
-                body.get("turn"),
-                target_path,
+                "[ingest] session=%s turn=%s",
+                session_id, turn_num,
             )
             try:
                 with open(
@@ -1389,7 +1389,91 @@ class SkillClawAPIServer:
                     detail=f"failed to write record: {e}",
                 )
 
-            return {"ok": True, "appended": 1, "path": str(target_path)}
+            # Upsert the per-session evolve-queue file at
+            # ``{shared_root}/{group}/sessions/<session_id>.json``.
+            # evolve_server's cycle drains from there — without this,
+            # turns appended to ``conversations.jsonl`` never become
+            # visible to evolve.  We accumulate turns inline so each
+            # POST leaves a complete cumulative session record; evolve
+            # picks up the latest snapshot on its next cycle.
+            uploaded_to_queue = False
+            queue_error: Optional[str] = None
+            if owner.config.sharing_enabled:
+                try:
+                    from .skill_hub import SkillHub
+                    hub = SkillHub.from_config(owner.config)
+                    queue_key = (
+                        f"{hub._prefix()}sessions/{session_id}.json"
+                    )
+                    # Read existing record if present (idempotent across
+                    # concurrent ingests — last writer wins which is fine
+                    # since each turn is monotonically appended).
+                    try:
+                        existing_bytes = hub._bucket.get_object(
+                            queue_key,
+                        ).read()
+                        session_doc = json.loads(
+                            existing_bytes.decode("utf-8"),
+                        )
+                        if not isinstance(session_doc, dict):
+                            session_doc = {}
+                    except Exception as _e:  # pylint: disable=broad-exception-caught
+                        session_doc = {}
+
+                    session_doc.setdefault("session_id", session_id)
+                    session_doc.setdefault("source", "copaw-ingest")
+                    session_doc["last_updated"] = body.get(
+                        "timestamp",
+                    ) or session_doc.get("last_updated", "")
+                    turns: list[dict] = list(session_doc.get("turns") or [])
+
+                    # Replace-or-append: same turn number overwrites
+                    # (re-ingestion safe), new turn appends.
+                    turn_record = {
+                        "turn_num": turn_num,
+                        "timestamp": body.get("timestamp", ""),
+                        "messages": body.get("messages", []),
+                        "injected_skills": body.get(
+                            "injected_skills", [],
+                        ),
+                        "read_skills": body.get("read_skills", []),
+                        "modified_skills": body.get(
+                            "modified_skills", [],
+                        ),
+                        # ``prm_score`` lazily filled later by
+                        # evolve_server (see ``summarizer.py``).
+                        "prm_score": body.get("prm_score"),
+                    }
+                    replaced = False
+                    for i, t in enumerate(turns):
+                        if int(t.get("turn_num") or 0) == turn_num:
+                            turns[i] = turn_record
+                            replaced = True
+                            break
+                    if not replaced:
+                        turns.append(turn_record)
+                    session_doc["turns"] = turns
+
+                    payload_bytes = json.dumps(
+                        session_doc, ensure_ascii=False,
+                    ).encode("utf-8")
+                    hub._bucket.put_object(queue_key, payload_bytes)
+                    uploaded_to_queue = True
+                except Exception as e:  # pylint: disable=broad-exception-caught
+                    queue_error = f"{type(e).__name__}: {e}"
+                    logger.warning(
+                        "[ingest] sessions/ upsert failed (record still "
+                        "written to conversations.jsonl): %s",
+                        queue_error,
+                    )
+
+            return {
+                "ok": True,
+                "appended": 1,
+                "path": str(target_path),
+                "uploaded_to_evolve_queue": uploaded_to_queue,
+                "queue_error": queue_error,
+            }
 
         @app.post("/v1/chat/completions")
         async def chat_completions(
