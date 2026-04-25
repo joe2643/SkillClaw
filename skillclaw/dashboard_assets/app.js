@@ -2081,6 +2081,16 @@ function renderFinalSkillDetail(skill) {
             ${badge(sync.label, sync.tone)}
           </div>
         </div>
+        <div class="action-row">
+          <button class="ghost danger" type="button"
+                  data-delete-skill="${escapeHtml(skill.skill_id)}"
+                  data-delete-skill-name="${escapeHtml(skill.name || "")}">
+            ${escapeHtml(l("删除此技能", "Delete this skill"))}
+          </button>
+          <span class="soft-copy" style="margin-left:8px">
+            ${escapeHtml(l("会从客户端缓存、共享池、manifest、registry 同 CoPaw workspace overrides 全部清走。", "Removes from client cache, shared pool, manifest, registry, and CoPaw workspace overrides."))}
+          </span>
+        </div>
         <div class="mini-grid">
           ${renderMiniCard(l("当前正式版", "Current Official Version"), `v${number(skill.current_version || 0)}`, l("共享库当前正式版本。", "Current official version in the shared pool."))}
           ${renderMiniCard(l("历史版本", "Version Count"), number(visibleVersionCount(skill)), l("当前能看到的共享版本数量。", "Number of shared versions currently visible."))}

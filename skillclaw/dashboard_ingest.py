@@ -441,6 +441,94 @@ def _extract_record_instruction(record: dict[str, Any]) -> str:
     return _clean_transcript_text(str(record.get("prompt_text", "") or ""))
 
 
+def _first_assistant_text_in_messages(
+    messages: list[Any] | None,
+    after_user_text: str = "",
+) -> str:
+    """Return the first assistant message's text from *messages*,
+    optionally requiring it to follow a user message whose text matches
+    *after_user_text*.
+
+    CoPaw's in-process capture hook fires ``pre_reasoning`` — the
+    captured ``messages`` for turn N include system + history + the
+    user's new instruction, but NOT the assistant response.  The
+    response only materialises in turn N+1's ``messages`` as the first
+    new ``assistant`` block appended after the matching user message.
+
+    When *after_user_text* is provided, we anchor the search to the
+    user message whose plain text equals it, so a quoted earlier user
+    message earlier in the list (memory-compaction case) doesn't
+    confuse us.  When *after_user_text* is empty, we fall back to the
+    last assistant message in the list — best-effort.
+    """
+    if not isinstance(messages, list):
+        return ""
+
+    if after_user_text:
+        anchor_idx = -1
+        for i, m in enumerate(messages):
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("role", "") or "").lower() != "user":
+                continue
+            text = _clean_transcript_text(_extract_message_text(m))
+            if text == after_user_text:
+                anchor_idx = i
+                break
+        if anchor_idx >= 0:
+            for m in messages[anchor_idx + 1:]:
+                if not isinstance(m, dict):
+                    continue
+                if str(m.get("role", "") or "").lower() != "assistant":
+                    continue
+                return _clean_transcript_text(_extract_message_text(m))
+
+    # Fallback: last assistant in the list.  Memory compaction can
+    # rewrite older user messages so the anchor lookup misses; the
+    # tail-most assistant is still the response we want most of the
+    # time.
+    last_assistant_text = ""
+    for m in messages:
+        if isinstance(m, dict) and str(
+            m.get("role", "") or "",
+        ).lower() == "assistant":
+            text = _clean_transcript_text(_extract_message_text(m))
+            if text:
+                last_assistant_text = text
+    return last_assistant_text
+
+
+def _backfill_response_text_from_next_turn(
+    turns: list[dict[str, Any]],
+) -> None:
+    """In-place: fill ``turn['response_text']`` for every turn whose
+    capture record didn't include one, by pulling from the next turn's
+    ``_messages_raw``.
+
+    Skipped when ``response_text`` is already non-empty (proxy-era
+    captures already populated it; we don't second-guess them).  The
+    last turn never gets backfilled — there's no next turn to read
+    from — and stays as ``""``, which is fine: the dashboard renders
+    ``(empty)`` for those, signalling "still in flight or interrupted
+    here".
+    """
+    for i, turn in enumerate(turns):
+        if turn.get("response_text"):
+            continue
+        next_turn = turns[i + 1] if i + 1 < len(turns) else None
+        if next_turn is None:
+            continue
+        next_messages = next_turn.get("_messages_raw")
+        if not next_messages:
+            continue
+        prompt = str(turn.get("prompt_text", "") or "")
+        response = _first_assistant_text_in_messages(
+            next_messages, after_user_text=prompt,
+        )
+        if response:
+            turn["response_text"] = _trim_message(response)
+
+
 def _normalize_tool_calls(raw: Any) -> list[dict[str, Any]]:
     if not isinstance(raw, list):
         return []
@@ -549,6 +637,16 @@ def _load_record_sessions(config: SkillClawConfig, warnings: list[str]) -> list[
                     "tool_errors": [],
                     "injected_skills": [],
                     "prm_score": prm_scores.get((session_id, turn_num)),
+                    # Stashed for ``_backfill_response_text_from_next_turn``
+                    # to derive the assistant reply when the capture hook
+                    # fired before the model responded (the in-process
+                    # CoPaw pre-reasoning hook captures messages = system
+                    # + history + new user msg, with no response yet —
+                    # the response lands in the NEXT turn's messages).
+                    # Popped before this turn is yielded to the caller.
+                    "_messages_raw": payload.get("messages") if isinstance(
+                        payload.get("messages"), list,
+                    ) else None,
                 }
 
                 existing_line = group["line_index"].get(turn_num, -1)
@@ -562,6 +660,9 @@ def _load_record_sessions(config: SkillClawConfig, warnings: list[str]) -> list[
     sessions: list[dict[str, Any]] = []
     for session_id, group in grouped.items():
         turns = [group["turns"][turn_num] for turn_num in sorted(group["turns"])]
+        _backfill_response_text_from_next_turn(turns)
+        for turn in turns:
+            turn.pop("_messages_raw", None)
         sessions.append(
             {
                 "session_id": session_id,
