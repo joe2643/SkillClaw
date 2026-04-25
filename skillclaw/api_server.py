@@ -1566,6 +1566,81 @@ class SkillClawAPIServer:
                 ],
             })
 
+        @app.post("/v1/sessions/ingest")
+        async def ingest_session_record(
+            request: Request,
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """Direct session-record ingest — bypass the chat-completions
+            proxy when the upstream agent already runs in-process and
+            doesn't need request forwarding (e.g. CoPaw).
+
+            Caller posts the same per-turn record shape the proxy
+            otherwise writes itself (see ``conversations.jsonl``):
+            ``{session_id, turn, timestamp, messages, ...}``.
+
+            Append-only; honours ``record_enabled`` so a server started
+            without record capture refuses ingest.  Auth gate matches
+            the rest of the API.
+
+            Returns ``{"ok": true, "appended": 1}`` on success.
+            """
+            owner: SkillClawAPIServer = request.app.state.owner
+            await owner._check_auth(authorization)
+
+            if not owner._record_file:
+                raise HTTPException(
+                    status_code=409,
+                    detail="record capture is disabled on this server",
+                )
+
+            try:
+                body = await request.json()
+            except Exception as e:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"invalid JSON body: {e}",
+                )
+
+            # Minimum schema compatible with the proxy's own writer +
+            # ``evolve_server`` summarizer.  Extra fields pass through
+            # unchanged so callers can opt into proxy parity by sending
+            # ``instruction_text`` / ``prompt_text`` / etc. when known.
+            required = {"session_id", "turn", "timestamp", "messages"}
+            missing = required - body.keys()
+            if missing:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"missing required fields: {sorted(missing)}",
+                )
+            if not isinstance(body["messages"], list) or not body["messages"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail="messages must be a non-empty list",
+                )
+
+            target_path = owner._record_file
+            logger.info(
+                "[ingest] writing session=%s turn=%s to %s",
+                body.get("session_id"),
+                body.get("turn"),
+                target_path,
+            )
+            try:
+                with open(
+                    target_path, "a", encoding="utf-8",
+                ) as f:
+                    f.write(json.dumps(body, ensure_ascii=False) + "\n")
+                    f.flush()
+            except OSError as e:
+                logger.warning("[ingest] write failed: %s", e)
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"failed to write record: {e}",
+                )
+
+            return {"ok": True, "appended": 1, "path": str(target_path)}
+
         @app.post("/v1/chat/completions")
         async def chat_completions(
             request: Request,
