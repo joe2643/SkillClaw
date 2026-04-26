@@ -33,9 +33,25 @@ NO_SKILL_KEY = "__no_skill__"
 
 
 class DecisionAction:
-    """Allowed evolution-decision action identifiers."""
+    """Allowed evolution-decision action identifiers.
+
+    The first four are the original "what to do given current skill +
+    sessions" outcomes.  The trailing three were added so the LLM can
+    interact with already-pending candidates instead of stacking
+    duplicates: when ``evolve_skill_from_sessions`` is called with the
+    ``pending_candidates`` list non-empty, the LLM can decide that
+    one of those pending entries already covers the new evidence
+    (``SKIP_REDUNDANT``), needs to be replaced with a tighter
+    proposal (``UPDATE_PENDING``), or is plain wrong and should be
+    marked rejected outright (``REJECT_PENDING``).
+    """
 
     CREATE = "create_skill"
     IMPROVE = "improve_skill"
     OPTIMIZE_DESC = "optimize_description"
     SKIP = "skip"
+    # Pending-pool-aware outcomes — only valid when pending candidates
+    # for this skill exist at decision time.
+    SKIP_REDUNDANT = "skip_redundant"
+    UPDATE_PENDING = "update_pending_candidate"
+    REJECT_PENDING = "reject_pending_candidate"

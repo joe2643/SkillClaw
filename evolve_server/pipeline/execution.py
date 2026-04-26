@@ -188,6 +188,83 @@ If action is skip:
   "rationale": "<why skipping>"
 }}
 ```
+
+## Pending-pool-aware actions
+
+When the user message includes a ``## Pending candidates already \
+queued for this skill`` section, you have THREE additional actions \
+available that interact with those pending entries directly. Use \
+them to keep the candidate pool deduplicated; without them, every \
+evolve cycle stacks another candidate on top of the previous \
+unvalidated proposals.
+
+5. **skip_redundant** — At least one pending candidate already \
+covers the change this evidence would justify. The pending entry \
+is sufficient; no new action.
+
+6. **update_pending_candidate** — A pending candidate is on the \
+right track but this evidence improves the proposal. Replace it \
+with a single tighter version. Provide the FULL new skill payload \
+PLUS ``target_pending_job_id`` to identify which pending entry to \
+overwrite.
+
+7. **reject_pending_candidate** — A pending candidate is wrong, \
+superseded, or proposes a change this evidence contradicts. Mark \
+it rejected without producing a replacement. Provide \
+``target_pending_job_id`` and a clear rationale.
+
+Decision rubric for the pending-aware actions:
+
+- Multiple pending candidates already exist? → Almost always pick \
+``update_pending_candidate`` against the latest one (so the queue \
+stays at one) OR ``reject_pending_candidate`` if the pending is \
+actively wrong.
+- The pending and the new evidence both point to the same \
+description tightening? → ``skip_redundant``. Don't re-propose.
+- A pending candidate proposes content the new evidence \
+contradicts? → ``reject_pending_candidate`` with a clear \
+contradiction citation.
+- Default: prefer ``update_pending_candidate`` over creating a new \
+candidate when ANY relevant pending entry exists.
+
+If the pending section is empty or absent, fall back to the four \
+original actions (improve_skill / optimize_description / \
+create_skill / skip).
+
+## Output format for pending-aware actions
+
+If action is skip_redundant:
+```
+{{
+  "action": "skip_redundant",
+  "rationale": "<which pending entry already covers this and why>",
+  "target_pending_job_id": "<job_id of the pending entry that \
+covers it>"
+}}
+```
+
+If action is update_pending_candidate:
+```
+{{
+  "action": "update_pending_candidate",
+  "rationale": "<why this evidence tightens the existing proposal>",
+  "target_pending_job_id": "<job_id of the pending entry to overwrite>",
+  "skill": {{
+    <full payload — same shape as the equivalent improve_skill /
+    optimize_description / create_skill action that the original
+    candidate would have used>
+  }}
+}}
+```
+
+If action is reject_pending_candidate:
+```
+{{
+  "action": "reject_pending_candidate",
+  "rationale": "<why the pending entry is wrong / contradicted>",
+  "target_pending_job_id": "<job_id of the pending entry to reject>"
+}}
+```
 """
 
 _CREATE_FROM_SESSIONS_SYSTEM = """\
@@ -363,21 +440,107 @@ def _write_debug_dump(stem: str, system: str, user_msg: str, raw: str | None = N
     logger.info("[DebugDump] wrote %s prompt artifacts to %s", stem, dump_dir)
 
 
+def _build_pending_candidates_block(
+    pending: list[dict],
+    max_entries: int = 3,
+) -> str:
+    """Render the most recent pending candidates as a Markdown section
+    the LLM can reference by ``job_id``.
+
+    The list is sorted newest-first (job_id is timestamp-prefixed so a
+    descending string sort gives chronological order).  Capped at
+    ``max_entries`` — the pool can have many duplicates queued before
+    cleanup; including all of them blows the prompt budget without
+    helping the LLM make a better decision.
+
+    Returns an empty string when *pending* is empty so the caller can
+    skip emitting the section header entirely (the prompt's
+    pending-aware actions only activate when this section is present).
+    """
+    if not pending:
+        return ""
+    items = sorted(
+        (j for j in pending if isinstance(j, dict)),
+        key=lambda j: str(j.get("job_id", "") or ""),
+        reverse=True,
+    )[:max_entries]
+    if not items:
+        return ""
+
+    blocks: list[str] = []
+    for job in items:
+        job_id = str(job.get("job_id", "") or "")
+        action = str(job.get("proposed_action", "") or "")
+        candidate = job.get("candidate_skill") or {}
+        rationale = str(job.get("rationale", "") or "").strip()
+        desc = str(candidate.get("description", "") or "").strip()
+        edit_summary = candidate.get("edit_summary") or {}
+
+        block_lines = [
+            f"### Pending candidate `{job_id}`",
+            f"- proposed_action: `{action}`",
+        ]
+        if desc:
+            block_lines.append(f"- description: {desc}")
+        if isinstance(edit_summary, dict) and edit_summary.get("notes"):
+            block_lines.append(
+                f"- edit_summary.notes: {edit_summary['notes']}",
+            )
+        if rationale:
+            block_lines.append(f"- rationale: {rationale}")
+
+        # For improve_skill candidates the body content is the meat —
+        # include a clipped excerpt so the LLM can compare against
+        # what this evidence would propose.  Pure description-only
+        # changes (optimize_description) don't need the body.
+        body = str(candidate.get("content", "") or "")
+        if body and action == "improve_skill":
+            body_clip = body if len(body) <= 1200 else (body[:1200] + "\n…[truncated]")
+            block_lines.append(
+                "- content excerpt:\n```\n" + body_clip + "\n```",
+            )
+
+        blocks.append("\n".join(block_lines))
+
+    return (
+        "## Pending candidates already queued for this skill\n\n"
+        + ("\n\n".join(blocks))
+        + "\n\n"
+        "If any of these already cover the change this evidence would "
+        "justify, prefer the pending-aware actions "
+        "(`skip_redundant` / `update_pending_candidate` / "
+        "`reject_pending_candidate`) over queuing yet another "
+        "duplicate.\n\n"
+    )
+
+
 async def evolve_skill_from_sessions(
     llm: AsyncLLMClient,
     skill_name: str,
     sessions: list[dict],
     current_skill: Optional[dict],
     existing_skill_names: list[str],
+    pending_candidates: Optional[list[dict]] = None,
 ) -> Optional[dict]:
-    """Combined decision + execution for one existing-skill session group."""
+    """Combined decision + execution for one existing-skill session group.
+
+    When *pending_candidates* is non-empty, the caller has already
+    queued one or more validation jobs for this same ``skill_name``
+    that haven't been validated yet.  We surface them in the LLM
+    prompt so the model can choose to ``skip_redundant`` /
+    ``update_pending_candidate`` / ``reject_pending_candidate``
+    instead of stacking another duplicate.  See ``DecisionAction``
+    in ``core/constants.py`` for the full action list.
+    """
     system = _EVOLVE_FROM_SESSIONS_SYSTEM.replace("{skill_name}", skill_name)
     skill_section = _build_skill_block(current_skill) if current_skill else ""
     evidence = _build_session_evidence(sessions)
+    pending_section = _build_pending_candidates_block(pending_candidates or [])
     user_msg = (
         f"{skill_section}"
         f"## Session evidence ({len(sessions)} sessions)\n\n"
         f"{evidence}\n\n"
+        f"{pending_section}"
         f"## Existing skill names in the library\n\n"
         f"{', '.join(existing_skill_names) or '(none)'}\n"
     )
@@ -447,6 +610,50 @@ def _parse_evolve_result(raw: str, skill_name: str) -> Optional[dict]:
     action = result.get("action", DecisionAction.SKIP)
     if action == DecisionAction.SKIP:
         return {"action": DecisionAction.SKIP, "rationale": result.get("rationale", "")}
+
+    # Pending-pool-aware actions branch first — they have their own
+    # required-field semantics.  Each MUST carry ``target_pending_job_id``;
+    # silently demote a malformed response to plain ``skip`` so we don't
+    # accidentally apply an update to the wrong candidate.
+    if action in (DecisionAction.SKIP_REDUNDANT, DecisionAction.REJECT_PENDING):
+        target_id = str(result.get("target_pending_job_id", "") or "").strip()
+        if not target_id:
+            logger.warning(
+                "[SessionExec] '%s' action for '%s' missing "
+                "target_pending_job_id — demoting to skip",
+                action, skill_name,
+            )
+            return {
+                "action": DecisionAction.SKIP,
+                "rationale": result.get("rationale", ""),
+            }
+        return {
+            "action": action,
+            "rationale": result.get("rationale", ""),
+            "target_pending_job_id": target_id,
+        }
+
+    if action == DecisionAction.UPDATE_PENDING:
+        target_id = str(result.get("target_pending_job_id", "") or "").strip()
+        skill_data = result.get("skill")
+        if not target_id or not isinstance(skill_data, dict):
+            logger.warning(
+                "[SessionExec] update_pending for '%s' missing "
+                "target_pending_job_id or skill payload — demoting to skip",
+                skill_name,
+            )
+            return {
+                "action": DecisionAction.SKIP,
+                "rationale": result.get("rationale", ""),
+            }
+        if skill_name and not skill_data.get("name"):
+            skill_data["name"] = skill_name
+        return {
+            "action": action,
+            "rationale": result.get("rationale", ""),
+            "target_pending_job_id": target_id,
+            "skill": skill_data,
+        }
 
     skill_data = result.get("skill")
     if not isinstance(skill_data, dict):

@@ -702,18 +702,89 @@ class EvolveServer:
             await self._call_storage(self._load_remote_skill_record, skill_name),
         )
 
+        # Surface pending candidates already queued for this skill so the
+        # LLM can update / reject them instead of stacking duplicates.
+        # See ``DecisionAction.SKIP_REDUNDANT`` etc. in ``core/constants.py``.
+        pending_candidates: list[dict] = []
+        if self.config.publish_mode == "validated":
+            for job in self._validation_store.list_jobs():
+                if str(job.get("candidate_skill_name", "") or "") != skill_name:
+                    continue
+                if self._validation_store.load_decision(
+                    str(job.get("job_id", "") or ""),
+                ):
+                    continue
+                pending_candidates.append(job)
+
         result = await evolve_skill_from_sessions(
             self._llm,
             skill_name,
             sessions,
             current_skill,
             existing_skill_names,
+            pending_candidates=pending_candidates,
         )
         if not result or result.get("action") == DecisionAction.SKIP:
             logger.info("[EvolveServer] skill '%s': LLM decided to skip", skill_name)
             return None
 
         action_type = result.get("action", DecisionAction.IMPROVE)
+
+        # ---------- Pending-pool-aware branches ---------------------------
+        if action_type == DecisionAction.SKIP_REDUNDANT:
+            target = str(result.get("target_pending_job_id", "") or "")
+            logger.info(
+                "[EvolveServer] skill '%s': pending candidate %s already "
+                "covers this evidence — skip_redundant",
+                skill_name, target,
+            )
+            return {
+                "action": DecisionAction.SKIP_REDUNDANT,
+                "skill_name": skill_name,
+                "target_pending_job_id": target,
+                "rationale": result.get("rationale", ""),
+                "uploaded": False,
+            }
+
+        if action_type == DecisionAction.REJECT_PENDING:
+            target = str(result.get("target_pending_job_id", "") or "")
+            applied = self._reject_pending_candidate(
+                target, result.get("rationale", ""), skill_name,
+            )
+            return {
+                "action": DecisionAction.REJECT_PENDING,
+                "skill_name": skill_name,
+                "target_pending_job_id": target,
+                "rationale": result.get("rationale", ""),
+                "uploaded": False,
+                "applied": applied,
+            }
+
+        if action_type == DecisionAction.UPDATE_PENDING:
+            target = str(result.get("target_pending_job_id", "") or "")
+            evolved_skill = result.get("skill") or {}
+            if current_skill:
+                self._inherit_current_skill(
+                    evolved_skill, current_skill,
+                    overwrite_body=False,
+                )
+            applied = self._update_pending_candidate(
+                target,
+                evolved_skill,
+                sessions,
+                result.get("rationale", ""),
+                skill_name,
+            )
+            return {
+                "action": DecisionAction.UPDATE_PENDING,
+                "skill_name": skill_name,
+                "target_pending_job_id": target,
+                "rationale": result.get("rationale", ""),
+                "uploaded": False,
+                "applied": applied,
+            }
+
+        # ---------- Original create / improve / optimize_description -----
         evolved_skill = result.get("skill")
         if not evolved_skill:
             return None
@@ -731,6 +802,144 @@ class EvolveServer:
             "skill_group",
             current_skill=current_skill,
         )
+
+    def _reject_pending_candidate(
+        self, job_id: str, rationale: str, skill_name: str,
+    ) -> bool:
+        """Mark a pending candidate ``rejected`` so it leaves the queue.
+
+        Belt-and-braces — guards against (a) the LLM hallucinating a
+        non-existent job_id and (b) racing against a candidate that was
+        already decided between the prompt build and the response.
+        """
+        if not job_id:
+            return False
+        try:
+            existing_decision = self._validation_store.load_decision(job_id)
+            if existing_decision:
+                logger.info(
+                    "[EvolveServer] reject_pending for skill '%s' job %s "
+                    "no-op — already decided as %s",
+                    skill_name, job_id, existing_decision.get("status"),
+                )
+                return False
+            job = self._validation_store.load_job(job_id)
+            if not job:
+                logger.warning(
+                    "[EvolveServer] reject_pending for skill '%s' job %s "
+                    "no-op — job not found",
+                    skill_name, job_id,
+                )
+                return False
+            self._validation_store.save_decision(
+                job_id,
+                {
+                    "status": "rejected",
+                    "reason": (
+                        "rejected by evolve LLM during pending-aware "
+                        f"dedup: {rationale[:300]}"
+                    ),
+                    "result_count": 0,
+                    "accepted_count": 0,
+                    "rejected_count": 1,
+                    "mean_score": None,
+                    "rejected_by_evolve": True,
+                },
+            )
+            logger.info(
+                "[EvolveServer] rejected pending candidate %s for "
+                "skill '%s' (LLM dedup)",
+                job_id, skill_name,
+            )
+            return True
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "[EvolveServer] reject_pending failed for %s: %s",
+                job_id, e,
+            )
+            return False
+
+    def _update_pending_candidate(
+        self,
+        job_id: str,
+        evolved_skill: dict,
+        sessions: list[dict],
+        rationale: str,
+        skill_name: str,
+    ) -> bool:
+        """Replace a pending candidate's ``candidate_skill`` payload with
+        ``evolved_skill``.  Re-runs ``_build_validation_evidence`` and
+        ``_build_replay_cases`` against the merged session set so the
+        worker has fresh evidence to validate against; the original
+        ``proposed_action`` and thresholds are preserved.
+
+        Same race guards as :meth:`_reject_pending_candidate`.
+        """
+        if not job_id or not isinstance(evolved_skill, dict):
+            return False
+        try:
+            if self._validation_store.load_decision(job_id):
+                logger.info(
+                    "[EvolveServer] update_pending for skill '%s' job %s "
+                    "no-op — already decided",
+                    skill_name, job_id,
+                )
+                return False
+            job = self._validation_store.load_job(job_id)
+            if not job:
+                logger.warning(
+                    "[EvolveServer] update_pending for skill '%s' job %s "
+                    "no-op — job not found",
+                    skill_name, job_id,
+                )
+                return False
+
+            # Merge new sessions into existing evidence so the worker has
+            # the union of past + present evidence to replay against.
+            prior_session_ids = {
+                str(sid) for sid in (job.get("session_ids") or [])
+            }
+            new_sessions = [
+                s for s in sessions
+                if str(s.get("session_id", "")) not in prior_session_ids
+            ]
+            merged_sessions = list(sessions)  # we already have full data here
+            # Existing session_ids stay listed for audit even if their
+            # full session data isn't in ``merged_sessions`` anymore.
+            all_session_ids = list(prior_session_ids | {
+                str(s.get("session_id", "")) for s in merged_sessions
+            })
+
+            updated = dict(job)
+            updated["candidate_skill"] = evolved_skill
+            updated["session_ids"] = all_session_ids
+            updated["session_evidence"] = self._build_validation_evidence(
+                merged_sessions,
+            )
+            updated["replay_cases"] = self._build_replay_cases(merged_sessions)
+            updated["rationale"] = (
+                f"{job.get('rationale', '') or ''}\n\n"
+                f"--- update from evolve dedup ---\n{rationale}"
+            ).strip()
+            updated["updated_at"] = datetime.now(timezone.utc).isoformat()
+            updated.setdefault("update_count", 0)
+            updated["update_count"] = int(updated["update_count"]) + 1
+
+            self._validation_store.save_job(updated)
+            logger.info(
+                "[EvolveServer] updated pending candidate %s for "
+                "skill '%s' (LLM dedup; +%d new sessions, "
+                "update_count=%d)",
+                job_id, skill_name, len(new_sessions),
+                updated["update_count"],
+            )
+            return True
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            logger.warning(
+                "[EvolveServer] update_pending failed for %s: %s",
+                job_id, e,
+            )
+            return False
 
     async def _handle_no_skill_sessions(
         self,
