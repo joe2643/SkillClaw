@@ -565,16 +565,23 @@ class DashboardService:
         # ``hub.sync_skills`` does pull-then-push and internally calls
         # ``self.sync()`` after both legs land — so we get the dashboard
         # projection refresh for free.
+        #
+        # We deliberately catch *only* storage / network / timing
+        # failures here.  A blanket ``except Exception`` would also
+        # swallow ``TypeError`` / ``AttributeError`` / ``ValueError``
+        # — programmer or config bugs that should fail loud, not
+        # silently desync the local skill_pool from the shared bucket
+        # while the dashboard reports a clean state.  The visible
+        # mode is the worst: publish succeeded, dashboard refreshed,
+        # CoPaw stays on stale skills indefinitely with no signal.
         try:
             sync_skills_result = self.sync_skills()
-        except Exception as e:  # pylint: disable=broad-exception-caught
-            # Sync failure must NOT roll back the evolve publish.  Log
-            # and fall through to a plain projection rebuild so the
-            # dashboard at least sees the new published rows.
+        except (OSError, IOError, TimeoutError, ConnectionError) as e:
             logger.warning(
-                "post-publish sync_skills failed (skills published "
-                "to shared bucket but local skill_pool may be stale "
-                "until next manual sync): %s", e,
+                "post-publish sync_skills hit a transient I/O / "
+                "network failure (skills published to shared bucket "
+                "but local skill_pool may be stale until next manual "
+                "sync): %s", e,
             )
             sync_result = self.sync()
             return {"sync": sync_result["summary"]}

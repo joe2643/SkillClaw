@@ -811,6 +811,20 @@ class EvolveServer:
         Belt-and-braces — guards against (a) the LLM hallucinating a
         non-existent job_id and (b) racing against a candidate that was
         already decided between the prompt build and the response.
+
+        **Concurrency caveat.**  ``ValidationStore.save_decision`` is a
+        blind ``put_object`` — if a second writer (e.g. a parallel
+        evolve_server instance, or the dashboard's manual approve
+        path) lands a decision between our ``load_decision`` check
+        and our ``save_decision`` call, our reject will overwrite it.
+        Two concurrent ``reject_pending_candidate`` calls produce the
+        same rejection record so last-writer-wins is benign there;
+        a reject vs. a manual ``approve`` race is not, but the live
+        deployment runs a single evolve_server process serially per
+        cycle (see workflow.py's per-skill loop).  If you start
+        running multiple evolve_server instances against the same
+        shared bucket, add an ETag/If-Match check to ValidationStore
+        before merging this comment out.
         """
         if not job_id:
             return False
@@ -873,7 +887,14 @@ class EvolveServer:
         worker has fresh evidence to validate against; the original
         ``proposed_action`` and thresholds are preserved.
 
-        Same race guards as :meth:`_reject_pending_candidate`.
+        Same race caveat as :meth:`_reject_pending_candidate`: two
+        concurrent ``_update_pending_candidate`` calls against the
+        same job_id last-writer-wins, dropping one writer's merged
+        sessions/rationale/update_count.  The live deployment runs a
+        single evolve_server process serially per cycle so this can't
+        happen in production today.  If multi-instance evolve becomes
+        a thing, add an If-Match ETag in ValidationStore.save_job
+        and check ``update_count`` before writing.
         """
         if not job_id or not isinstance(evolved_skill, dict):
             return False

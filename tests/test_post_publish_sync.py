@@ -74,15 +74,18 @@ class PostPublishSyncTests(unittest.TestCase):
         self.assertNotIn("skills_synced", out)
         self.assertEqual(out["sync"]["skills"], 0)
 
-    def test_swallows_sync_skills_failure_and_falls_back(self) -> None:
+    def test_swallows_io_failure_and_falls_back(self) -> None:
         """A flaky shared bucket / network must NEVER roll back the
         evolve publish — the new skill is already in the bucket; this
         helper just loses the local-pool refresh.  Log + fall through
-        to plain ``sync`` so the dashboard projection still updates."""
+        to plain ``sync`` so the dashboard projection still updates.
+
+        Only storage/network exceptions are caught — see
+        :meth:`test_propagates_programmer_errors` for the contrast."""
         service = DashboardService(self.fixture.config)
         with patch.object(
             service, "sync_skills",
-            side_effect=RuntimeError("simulated S3 timeout"),
+            side_effect=ConnectionError("simulated S3 timeout"),
         ) as mock_sync_skills, patch.object(
             service, "sync",
             return_value={"summary": {"skills": 7}},
@@ -93,6 +96,27 @@ class PostPublishSyncTests(unittest.TestCase):
         mock_plain_sync.assert_called_once()
         self.assertEqual(out["sync"]["skills"], 7)
         self.assertNotIn("skills_synced", out)
+
+    def test_propagates_programmer_errors(self) -> None:
+        """A blanket ``except Exception`` was the previous behaviour and
+        masked programmer bugs (typo'd attr access, bad config) the
+        same way it masked transient I/O — leaving the dashboard
+        cleanly synced while the local skill_pool stayed indefinitely
+        stale.  Confirm those bug-shaped exceptions now propagate."""
+        service = DashboardService(self.fixture.config)
+        with patch.object(
+            service, "sync_skills",
+            side_effect=AttributeError("typo'd attr in caller"),
+        ):
+            with self.assertRaises(AttributeError):
+                service._post_publish_sync_to_local({})
+
+        with patch.object(
+            service, "sync_skills",
+            side_effect=TypeError("bad arg from refactor"),
+        ):
+            with self.assertRaises(TypeError):
+                service._post_publish_sync_to_local({})
 
 
 if __name__ == "__main__":
