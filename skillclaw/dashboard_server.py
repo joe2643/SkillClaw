@@ -517,7 +517,14 @@ class DashboardService:
                 **published,
             }
         trigger_url = base_url.rstrip("/") + "/trigger"
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        # Cycle latency observed on the qwenpaw deployment: ~5–6
+        # minutes when the LLM has to summarise + judge ~5 skill
+        # groups.  ``300s`` was tight enough to ReadTimeout right at
+        # the cycle's tail; bumping to ``900s`` (15 min) gives
+        # headroom for slower upstream / busier days.  ReadTimeout
+        # surfaces as an HTTP 400 with empty ``detail`` to the caller,
+        # which previously masked the real cause.
+        async with httpx.AsyncClient(timeout=900.0) as client:
             response = await client.post(trigger_url)
             response.raise_for_status()
         result_payload = response.json()
