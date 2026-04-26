@@ -509,23 +509,79 @@ class DashboardService:
 
             server = self._embedded_evolve_server()
             result = await server.run_once()
-            sync_result = self.sync()
+            published = self._post_publish_sync_to_local(result)
             return {
                 "operation": "trigger-evolve",
                 "url": "embedded://local-evolve",
                 "result": result,
-                "sync": sync_result["summary"],
+                **published,
             }
         trigger_url = base_url.rstrip("/") + "/trigger"
         async with httpx.AsyncClient(timeout=300.0) as client:
             response = await client.post(trigger_url)
             response.raise_for_status()
-        sync_result = self.sync()
+        result_payload = response.json()
+        published = self._post_publish_sync_to_local(result_payload)
         return {
             "operation": "trigger-evolve",
             "url": trigger_url,
-            "result": response.json(),
-            "sync": sync_result["summary"],
+            "result": result_payload,
+            **published,
+        }
+
+    def _post_publish_sync_to_local(
+        self,
+        evolve_result: Any,
+    ) -> dict[str, Any]:
+        """Pull the freshly-published skills from the shared bucket
+        down to the local ``skills_dir`` (= CoPaw's ``skill_pool``)
+        and rebuild the dashboard projection.
+
+        Without this, an evolve cycle that publishes a new candidate
+        only writes to the SkillClaw shared bucket — CoPaw's local
+        ``~/.copaw/skill_pool/<name>/SKILL.md`` stays at the previous
+        version until someone runs ``skillclaw skills sync`` by hand,
+        and the running CoPaw agent keeps rendering the stale skill
+        from prompt-injection time.
+
+        The dashboard projection (``self.sync()``) is also rebuilt as
+        a side effect of ``hub.sync_skills`` (see its return shape) so
+        the candidate-pool counts and Final Pool table reflect the
+        new published version immediately.
+
+        Returns a dict with the keys ``trigger_evolve`` would have
+        emitted (``sync`` summary plus optional ``skills_synced`` from
+        the bidirectional pull/push).  No-op safe when sharing is
+        enabled but the publish set is empty — pull is idempotent and
+        push only sends local deltas.
+        """
+        # Best-effort guard: if sharing isn't enabled the caller's
+        # ``trigger_evolve`` would have already raised, so this branch
+        # is for defensive completeness when called from other paths.
+        if not self.config.sharing_enabled:
+            sync_result = self.sync()
+            return {"sync": sync_result["summary"]}
+
+        # ``hub.sync_skills`` does pull-then-push and internally calls
+        # ``self.sync()`` after both legs land — so we get the dashboard
+        # projection refresh for free.
+        try:
+            sync_skills_result = self.sync_skills()
+        except Exception as e:  # pylint: disable=broad-exception-caught
+            # Sync failure must NOT roll back the evolve publish.  Log
+            # and fall through to a plain projection rebuild so the
+            # dashboard at least sees the new published rows.
+            logger.warning(
+                "post-publish sync_skills failed (skills published "
+                "to shared bucket but local skill_pool may be stale "
+                "until next manual sync): %s", e,
+            )
+            sync_result = self.sync()
+            return {"sync": sync_result["summary"]}
+
+        return {
+            "sync": sync_skills_result["sync"],
+            "skills_synced": sync_skills_result["result"],
         }
 
 
