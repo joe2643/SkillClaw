@@ -610,17 +610,32 @@ async def _periodic_skill_sync_loop(
     ``_post_publish_sync_to_local``) eventually flow into the local
     ``skills_dir`` / CoPaw ``skill_pool``.
 
-    The loop sleeps FIRST and runs the sync after — same shape as
-    cron — so the very first sync isn't doubled with the
-    ``sync_on_start`` call already made in ``lifespan``.
+    The loop sleeps FIRST and runs the sync after — cron-shaped —
+    so a transient pull failure on first start doesn't fire before
+    the dashboard has even rendered.  The first sync therefore
+    fires at ``startup + interval``, not ``startup``; that's
+    intentional.  ``sync_on_start`` (a different call —
+    ``service.sync()``, just the projection rebuild) handles the
+    immediate-startup half.
 
-    Failures are logged and swallowed at a narrow exception set
-    (storage / network / timing) so a flaky shared bucket doesn't
-    crash the whole loop.  Programmer / config errors propagate so
-    they fail loud — same blast-radius philosophy as
-    :meth:`DashboardService._post_publish_sync_to_local`.
+    Failures are handled in two layers:
 
-    asyncio.CancelledError is re-raised cleanly so the lifespan
+    1. Narrow ``(OSError, IOError, TimeoutError, ConnectionError)``
+       at the ``sync_skills`` call site — transient I/O.  Logged
+       at WARNING, loop continues to the next tick.
+
+    2. Outer ``Exception`` (everything else: ``AttributeError``,
+       ``TypeError``, ``KeyError`` from a config / refactor bug,
+       a brand-new exception from a SkillHub upgrade) — logged at
+       ERROR with the full traceback, and the loop ALSO continues.
+       The whole point of this task is to be eventually-consistent;
+       letting a single programmer mistake silently kill the loop
+       (which is what happened before — codex caught it: lifespan
+       cleanup swallowed the dead-task exception with no signal,
+       so auto-approved skills would just stop syncing forever
+       after one bad cycle) defeats the purpose.
+
+    asyncio.CancelledError is always re-raised so the lifespan
     cleanup can stop the task on dashboard shutdown.
     """
     interval = max(10, int(interval_seconds))
@@ -640,8 +655,17 @@ async def _periodic_skill_sync_loop(
             raise
         except (OSError, IOError, TimeoutError, ConnectionError) as e:
             logger.warning(
-                "[Dashboard] periodic sync_skills failed (will retry "
-                "in %ds): %s", interval, e,
+                "[Dashboard] periodic sync_skills failed transient "
+                "I/O — will retry in %ds: %s", interval, e,
+            )
+            continue
+        except Exception:  # pylint: disable=broad-exception-caught
+            # Outer guard: a programmer / config bug must NOT kill
+            # the loop silently.  Log full traceback, sleep, retry.
+            logger.exception(
+                "[Dashboard] periodic sync_skills hit an unexpected "
+                "exception — loop continues so a one-shot bug "
+                "doesn't permanently desync the local skill_pool",
             )
             continue
 
@@ -693,8 +717,22 @@ def create_dashboard_app(config: SkillClawConfig) -> FastAPI:
                 sync_task.cancel()
                 try:
                     await sync_task
-                except (asyncio.CancelledError, Exception):  # pylint: disable=broad-exception-caught
+                except asyncio.CancelledError:
+                    # Expected — we just cancelled it.
                     pass
+                except Exception:  # pylint: disable=broad-exception-caught
+                    # The loop's inner ``except Exception`` continues
+                    # past programmer errors so this branch should be
+                    # rare — but if a refactor breaks the outer guard
+                    # the task could still die before shutdown.
+                    # Surface that with a real log line instead of
+                    # swallowing silently (codex review caught the
+                    # original blanket-pass).
+                    logger.exception(
+                        "[Dashboard] periodic skill sync task crashed "
+                        "before shutdown — auto-approved skills may "
+                        "have stopped syncing some time ago",
+                    )
 
     app = FastAPI(title="SkillClaw Dashboard", lifespan=lifespan)
     app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")

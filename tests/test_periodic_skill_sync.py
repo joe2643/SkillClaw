@@ -98,18 +98,38 @@ class PeriodicSyncLoopTests(unittest.IsolatedAsyncioTestCase):
         # Both ticks fired despite the first one raising.
         self.assertEqual(service.sync_skills.call_count, 2)
 
-    async def test_propagates_programmer_errors(self) -> None:
+    async def test_logs_unexpected_errors_and_continues(self) -> None:
         """``AttributeError`` / ``TypeError`` (programmer / config bugs)
-        must NOT be silently swallowed — they should fail loud the
-        same way as ``_post_publish_sync_to_local``'s narrow catch."""
+        must NOT silently kill the loop — codex review caught the
+        original "narrow catch only, let everything else propagate"
+        version because the lifespan cleanup swallowed the resulting
+        dead-task exception with no signal, which meant a single
+        refactor bug could permanently desync the local skill_pool.
+
+        New behaviour: log the traceback at ERROR, continue to the
+        next tick, so transient programmer bugs don't disable the
+        sync forever.  Cancellation still propagates cleanly.
+        """
         service = MagicMock()
-        service.sync_skills.side_effect = AttributeError("typo'd attr")
+        service.sync_skills.side_effect = [
+            AttributeError("typo'd attr — first tick fails"),
+            {"result": {"pull": {"downloaded": 1}, "push": {}}},
+        ]
         with patch("skillclaw.dashboard_server.asyncio.sleep") as mock_sleep:
-            mock_sleep.side_effect = [None, asyncio.CancelledError()]
-            with self.assertRaises(AttributeError):
-                await _periodic_skill_sync_loop(
-                    service, interval_seconds=15,
-                )
+            mock_sleep.side_effect = [None, None, asyncio.CancelledError()]
+            with self.assertLogs(
+                "skillclaw.dashboard_server", level="ERROR",
+            ) as caplog:
+                with self.assertRaises(asyncio.CancelledError):
+                    await _periodic_skill_sync_loop(
+                        service, interval_seconds=15,
+                    )
+        # First tick raised AttributeError, second tick succeeded.
+        self.assertEqual(service.sync_skills.call_count, 2)
+        # Full traceback logged so ops can find the cause.
+        joined = "\n".join(caplog.output)
+        self.assertIn("AttributeError", joined)
+        self.assertIn("typo'd attr", joined)
 
     async def test_cancellation_propagates_immediately(self) -> None:
         """Lifespan shutdown calls ``task.cancel()`` — the next sleep
@@ -189,6 +209,38 @@ class LifespanWiringTests(unittest.TestCase):
         # Lifespan cleanup ran — task should be cancelled / done.
         self.assertIsNotNone(captured_task)
         self.assertTrue(captured_task.cancelled() or captured_task.done())
+
+    def test_pre_failed_task_surfaces_at_shutdown(self) -> None:
+        """If the loop somehow dies before shutdown (e.g. a refactor
+        breaks the outer Exception guard), the lifespan cleanup must
+        log the traceback rather than silently swallow it.  Codex
+        flagged the original blanket ``except (Cancelled, Exception):
+        pass`` for masking real bugs at shutdown time."""
+        cfg = self.fixture.config
+        cfg.dashboard_skill_sync_interval_seconds = 30
+        from fastapi.testclient import TestClient
+        from skillclaw.dashboard_server import create_dashboard_app
+
+        # Replace the loop with one that raises immediately so the
+        # task is dead by the time cleanup awaits it.
+        async def _exploding_loop(service, interval_seconds):
+            raise RuntimeError("simulated loop crash")
+
+        with patch(
+            "skillclaw.dashboard_server._periodic_skill_sync_loop",
+            _exploding_loop,
+        ):
+            app = create_dashboard_app(cfg)
+            with self.assertLogs(
+                "skillclaw.dashboard_server", level="ERROR",
+            ) as caplog:
+                with TestClient(app) as client:
+                    # Give the event loop a moment to schedule the task.
+                    client.get("/api/v1/health")
+
+            joined = "\n".join(caplog.output)
+            self.assertIn("RuntimeError", joined)
+            self.assertIn("simulated loop crash", joined)
 
 
 # ---------------------------------------------------------------------- #
