@@ -4,6 +4,7 @@ FastAPI dashboard service for SkillClaw.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from contextlib import asynccontextmanager
@@ -599,6 +600,62 @@ class DashboardService:
         }
 
 
+async def _periodic_skill_sync_loop(
+    service: "DashboardService",
+    interval_seconds: int,
+) -> None:
+    """Background task: every *interval_seconds* run
+    :meth:`DashboardService.sync_skills` so candidates that were
+    auto-approved by the ValidationWorker (whose path doesn't bundle
+    ``_post_publish_sync_to_local``) eventually flow into the local
+    ``skills_dir`` / CoPaw ``skill_pool``.
+
+    The loop sleeps FIRST and runs the sync after — same shape as
+    cron — so the very first sync isn't doubled with the
+    ``sync_on_start`` call already made in ``lifespan``.
+
+    Failures are logged and swallowed at a narrow exception set
+    (storage / network / timing) so a flaky shared bucket doesn't
+    crash the whole loop.  Programmer / config errors propagate so
+    they fail loud — same blast-radius philosophy as
+    :meth:`DashboardService._post_publish_sync_to_local`.
+
+    asyncio.CancelledError is re-raised cleanly so the lifespan
+    cleanup can stop the task on dashboard shutdown.
+    """
+    interval = max(10, int(interval_seconds))
+    logger.info(
+        "[Dashboard] periodic skill sync enabled — every %ds",
+        interval,
+    )
+    while True:
+        try:
+            await asyncio.sleep(interval)
+        except asyncio.CancelledError:
+            raise
+
+        try:
+            result = service.sync_skills()
+        except asyncio.CancelledError:
+            raise
+        except (OSError, IOError, TimeoutError, ConnectionError) as e:
+            logger.warning(
+                "[Dashboard] periodic sync_skills failed (will retry "
+                "in %ds): %s", interval, e,
+            )
+            continue
+
+        pull = result.get("result", {}).get("pull", {})
+        push = result.get("result", {}).get("push", {})
+        downloaded = int(pull.get("downloaded", 0) or 0)
+        uploaded = int(push.get("uploaded", 0) or 0)
+        if downloaded or uploaded:
+            logger.info(
+                "[Dashboard] periodic sync_skills: pulled %d, "
+                "pushed %d", downloaded, uploaded,
+            )
+
+
 def create_dashboard_app(config: SkillClawConfig) -> FastAPI:
     service = DashboardService(config)
     assets_dir = _assets_dir()
@@ -612,7 +669,32 @@ def create_dashboard_app(config: SkillClawConfig) -> FastAPI:
             except Exception:
                 logger.exception("[Dashboard] initial sync failed")
         app.state.dashboard_service = service
-        yield
+
+        # Spawn periodic skill-sync loop only when:
+        # 1. Sharing is enabled (otherwise sync_skills would raise)
+        # 2. Operator opted in via dashboard.skill_sync_interval_seconds
+        # The task is captured on app.state so cleanup can cancel it
+        # on shutdown — uvicorn's graceful path will wait for it.
+        sync_task: asyncio.Task | None = None
+        interval = int(
+            config.dashboard_skill_sync_interval_seconds or 0,
+        )
+        if config.sharing_enabled and interval > 0:
+            sync_task = asyncio.create_task(
+                _periodic_skill_sync_loop(service, interval),
+                name="dashboard.periodic_skill_sync",
+            )
+            app.state.periodic_skill_sync_task = sync_task
+
+        try:
+            yield
+        finally:
+            if sync_task is not None:
+                sync_task.cancel()
+                try:
+                    await sync_task
+                except (asyncio.CancelledError, Exception):  # pylint: disable=broad-exception-caught
+                    pass
 
     app = FastAPI(title="SkillClaw Dashboard", lifespan=lifespan)
     app.mount("/assets", StaticFiles(directory=assets_dir), name="assets")

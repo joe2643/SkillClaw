@@ -88,6 +88,7 @@ _DEFAULTS: dict = {
         "sync_on_start": True,
         "include_shared": True,
         "evolve_server_url": "",
+        "skill_sync_interval_seconds": 0,
     },
 }
 
@@ -370,6 +371,9 @@ class ConfigStore:
             dashboard_sync_on_start=bool(dashboard.get("sync_on_start", True)),
             dashboard_include_shared=bool(dashboard.get("include_shared", True)),
             dashboard_evolve_server_url=str(dashboard.get("evolve_server_url", "") or ""),
+            dashboard_skill_sync_interval_seconds=int(
+                dashboard.get("skill_sync_interval_seconds", 0) or 0,
+            ),
         )
 
     def describe(self) -> str:

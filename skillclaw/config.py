@@ -116,6 +116,14 @@ class SkillClawConfig:
     dashboard_sync_on_start: bool = True
     dashboard_include_shared: bool = True
     dashboard_evolve_server_url: str = ""
+    # Periodic background ``sync_skills`` so candidates that get
+    # **auto-approved** by the ValidationWorker (whose result file
+    # alone doesn't go through dashboard's manual-approve chain that
+    # bundles ``_post_publish_sync_to_local``) eventually land in the
+    # local ``skills_dir`` / CoPaw ``skill_pool``.  Disabled when set
+    # to 0 so test setups stay quiet; the operator setup at
+    # ``~/.skillclaw/config.yaml`` opts in via ``dashboard.skill_sync_interval_seconds``.
+    dashboard_skill_sync_interval_seconds: int = 0
 
     # ------------------------------------------------------------------ #
     # Cloud / Bedrock                                                      #
