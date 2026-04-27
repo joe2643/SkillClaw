@@ -242,6 +242,72 @@ class LifespanWiringTests(unittest.TestCase):
             self.assertIn("RuntimeError", joined)
             self.assertIn("simulated loop crash", joined)
 
+    def test_mid_run_crash_after_successful_iterations_logs_at_shutdown(
+        self,
+    ) -> None:
+        """Codex-review gap: the previous test only covered the
+        immediate-fail case (loop dies on first instruction).  The more
+        realistic shape is "loop ran several successful iterations,
+        then crashed on iteration N+1, then shutdown happened" — same
+        ``await sync_task`` reraise behaviour but proves the lifespan
+        cleanup handles the post-warmup crash too.
+
+        Important nuance about race timing: the cleanup's
+        ``logger.exception`` call only runs if the cancel-then-await
+        actually surfaces the stored RuntimeError.  TestClient's
+        synchronous shutdown path may reach the ``cancel()`` call
+        BEFORE the task has scheduled itself enough to raise — in that
+        case ``await task`` returns the CancelledError instead of the
+        RuntimeError.  We use ``asyncio.sleep(0)`` to yield control
+        between successful iterations so the task definitively gets
+        scheduling time, and an explicit ``time.sleep`` before the
+        TestClient context exits so the loop's exception is stored
+        before cleanup runs.
+        """
+        import time
+
+        cfg = self.fixture.config
+        cfg.dashboard_skill_sync_interval_seconds = 30
+        from fastapi.testclient import TestClient
+        from skillclaw.dashboard_server import create_dashboard_app
+
+        iterations_run = 0
+
+        async def _crashes_after_two_iterations(service, interval_seconds):
+            nonlocal iterations_run
+            for _ in range(2):
+                iterations_run += 1
+                # Yield control so the event loop can schedule other
+                # work — this also lets the test see iterations_run
+                # increment between the lifespan's startup yield and
+                # the cleanup phase.
+                await asyncio.sleep(0)
+            raise RuntimeError(
+                "simulated mid-run crash after 2 successful iterations",
+            )
+
+        with patch(
+            "skillclaw.dashboard_server._periodic_skill_sync_loop",
+            _crashes_after_two_iterations,
+        ):
+            app = create_dashboard_app(cfg)
+            with self.assertLogs(
+                "skillclaw.dashboard_server", level="ERROR",
+            ) as caplog:
+                with TestClient(app) as client:
+                    client.get("/api/v1/health")
+                    # Block long enough for the task to run all 2
+                    # iterations and reach the raise statement before
+                    # TestClient tears the lifespan down.
+                    time.sleep(0.05)
+
+        # Both successful iterations ran.
+        self.assertEqual(iterations_run, 2)
+        # Cleanup logged the eventual crash with full traceback.
+        joined = "\n".join(caplog.output)
+        self.assertIn("RuntimeError", joined)
+        self.assertIn("mid-run crash", joined)
+
 
 # ---------------------------------------------------------------------- #
 # 3. Config plumbing                                                     #
