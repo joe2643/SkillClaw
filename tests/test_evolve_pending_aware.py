@@ -30,6 +30,7 @@ from evolve_server.core.constants import DecisionAction
 from evolve_server.pipeline.execution import (
     _build_pending_candidates_block,
     _parse_evolve_result,
+    _preserve_existing_body_for_optimize_desc,
 )
 
 
@@ -284,3 +285,93 @@ class TestOriginalActionsUnchanged:
         out = _parse_evolve_result(raw, "demo")
         assert out["action"] == DecisionAction.SKIP
         assert "skill" not in out
+
+
+class TestPreserveExistingBodyForOptimizeDesc:
+    """Regression — ``optimize_description`` LLM contract returns only
+    ``name`` + ``description``. Without the splice, the candidate stored
+    in the validation job has empty body and finalize destroys the live
+    SKILL.md.  See ``_EVOLVE_FROM_SESSIONS_SYSTEM`` lines 159-168 for the
+    contract that motivates this defensive splice.
+    """
+
+    def _current(self):
+        return {
+            "name": "demo",
+            "description": "old desc",
+            "content": "# Heading\n\nfull body that must survive\n",
+            "category": "general",
+        }
+
+    def test_splices_body_when_optimize_desc_has_empty_content(self):
+        parsed = {
+            "action": DecisionAction.OPTIMIZE_DESC,
+            "skill": {"name": "demo", "description": "tightened desc"},
+        }
+        out = _preserve_existing_body_for_optimize_desc(parsed, self._current())
+        assert out is parsed
+        assert out["skill"]["content"] == "# Heading\n\nfull body that must survive\n"
+        assert out["skill"]["category"] == "general"
+        assert out["skill"]["description"] == "tightened desc"
+
+    def test_does_not_overwrite_when_llm_returned_body(self):
+        parsed = {
+            "action": DecisionAction.OPTIMIZE_DESC,
+            "skill": {
+                "name": "demo",
+                "description": "tightened",
+                "content": "llm-provided body",
+            },
+        }
+        out = _preserve_existing_body_for_optimize_desc(parsed, self._current())
+        assert out["skill"]["content"] == "llm-provided body"
+
+    def test_no_op_for_other_actions(self):
+        parsed = {
+            "action": DecisionAction.IMPROVE,
+            "skill": {"name": "demo", "description": "x"},
+        }
+        out = _preserve_existing_body_for_optimize_desc(parsed, self._current())
+        assert "content" not in out["skill"]
+
+    def test_no_op_when_current_skill_missing(self):
+        parsed = {
+            "action": DecisionAction.OPTIMIZE_DESC,
+            "skill": {"name": "demo", "description": "x"},
+        }
+        out = _preserve_existing_body_for_optimize_desc(parsed, None)
+        assert "content" not in out["skill"]
+
+    def test_no_op_when_current_skill_has_no_body(self):
+        parsed = {
+            "action": DecisionAction.OPTIMIZE_DESC,
+            "skill": {"name": "demo", "description": "x"},
+        }
+        out = _preserve_existing_body_for_optimize_desc(
+            parsed,
+            {"name": "demo", "description": "old"},
+        )
+        assert "content" not in out["skill"]
+
+    def test_does_not_overwrite_existing_category(self):
+        parsed = {
+            "action": DecisionAction.OPTIMIZE_DESC,
+            "skill": {
+                "name": "demo",
+                "description": "tightened",
+                "category": "workflow",
+            },
+        }
+        out = _preserve_existing_body_for_optimize_desc(parsed, self._current())
+        assert out["skill"]["category"] == "workflow"
+
+    def test_handles_none_parsed(self):
+        # _parse_evolve_result returns None on malformed JSON; helper
+        # must propagate None unchanged.
+        assert _preserve_existing_body_for_optimize_desc(None, self._current()) is None
+
+    def test_handles_skill_field_missing(self):
+        # Skip actions have no "skill" key — guard against KeyError.
+        parsed = {"action": DecisionAction.SKIP, "rationale": "..."}
+        out = _preserve_existing_body_for_optimize_desc(parsed, self._current())
+        assert out == {"action": DecisionAction.SKIP, "rationale": "..."}

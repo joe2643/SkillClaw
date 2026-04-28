@@ -33,6 +33,7 @@ from ..core.skill_registry import SkillIDRegistry
 from ..core.utils import build_skill_md, parse_skill_content
 from ..pipeline.aggregation import aggregate_sessions_by_skill
 from ..pipeline.execution import (
+    _preserve_existing_body_for_optimize_desc,
     create_skill_from_sessions,
     evolve_skill_from_sessions,
     execute_merge,
@@ -498,6 +499,35 @@ class EvolveServer:
                     summary["rejected"] += 1
                     continue
                 action_type = str(job.get("proposed_action", DecisionAction.CREATE) or DecisionAction.CREATE)
+                if action_type == DecisionAction.OPTIMIZE_DESC and not candidate_skill.get("content"):
+                    existing_md = await self._call_storage(self._fetch_skill, candidate_skill.get("name", ""))
+                    if existing_md:
+                        existing_skill = parse_skill_content(candidate_skill.get("name", ""), existing_md)
+                        _preserve_existing_body_for_optimize_desc(
+                            {"action": DecisionAction.OPTIMIZE_DESC, "skill": candidate_skill},
+                            existing_skill,
+                        )
+                    if not candidate_skill.get("content"):
+                        # Refuse to publish a body-less SKILL.md even when the
+                        # bucket fetch came up empty — uploading the candidate
+                        # as-is would clobber any future write of this skill
+                        # with frontmatter-only content.
+                        self._validation_store.save_decision(
+                            job_id,
+                            {
+                                "status": "rejected",
+                                "reason": (
+                                    "optimize_description candidate has empty body "
+                                    "and no live skill found in bucket to splice from"
+                                ),
+                                "result_count": len(results),
+                                "accepted_count": accepted,
+                                "rejected_count": rejected,
+                                "mean_score": mean_score,
+                            },
+                        )
+                        summary["rejected"] += 1
+                        continue
                 actual_action = await self._resolve_and_upload(candidate_skill, action_type)
                 self._validation_store.save_decision(
                     job_id,

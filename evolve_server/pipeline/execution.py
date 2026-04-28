@@ -554,7 +554,8 @@ async def evolve_skill_from_sessions(
     ]
     raw = await llm.chat(messages, max_tokens=8192, temperature=0.4)
     _write_debug_dump(stem, system, user_msg, raw)
-    return _parse_evolve_result(raw, skill_name)
+    parsed = _parse_evolve_result(raw, skill_name)
+    return _preserve_existing_body_for_optimize_desc(parsed, current_skill)
 
 
 async def create_skill_from_sessions(
@@ -581,6 +582,45 @@ async def create_skill_from_sessions(
     raw = await llm.chat(messages, max_tokens=8192, temperature=0.4)
     _write_debug_dump(stem, _CREATE_FROM_SESSIONS_SYSTEM, user_msg, raw)
     return _parse_evolve_result(raw, "")
+
+
+def _preserve_existing_body_for_optimize_desc(
+    parsed: Optional[dict],
+    current_skill: Optional[dict],
+) -> Optional[dict]:
+    """Splice ``current_skill.content`` into an ``optimize_description``
+    candidate whose body the LLM omitted.
+
+    The ``optimize_description`` LLM contract returns only ``name`` +
+    ``description`` (see ``_EVOLVE_FROM_SESSIONS_SYSTEM`` lines 159-168).
+    Without this splice, the candidate stored in the validation job
+    has an empty body, and a downstream finalize would overwrite the
+    bucket SKILL.md with frontmatter only — destroying the live skill.
+
+    Why: ``optimize_description`` by design changes only the description.
+    How to apply: call right after ``_parse_evolve_result`` whenever a
+    ``current_skill`` is available (i.e. any non-create action path).
+    """
+    if not parsed or not current_skill:
+        return parsed
+    if parsed.get("action") != DecisionAction.OPTIMIZE_DESC:
+        return parsed
+    skill = parsed.get("skill")
+    if not isinstance(skill, dict):
+        return parsed
+    if skill.get("content"):
+        return parsed
+    body = current_skill.get("content")
+    if not body:
+        return parsed
+    skill["content"] = body
+    if not skill.get("category") and current_skill.get("category"):
+        skill["category"] = current_skill["category"]
+    if not skill.get("extra_frontmatter"):
+        existing_extra = current_skill.get("extra_frontmatter")
+        if isinstance(existing_extra, dict) and existing_extra:
+            skill["extra_frontmatter"] = dict(existing_extra)
+    return parsed
 
 
 def _parse_evolve_result(raw: str, skill_name: str) -> Optional[dict]:
