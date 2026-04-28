@@ -252,8 +252,14 @@ class EvolveServerConfig:
             or ""
         )
         local_root = str(getattr(config, "sharing_local_root", "") or os.environ.get("EVOLVE_LOCAL_ROOT", ""))
-        llm_api_key = config.llm_api_key or config.prm_api_key
-        llm_base_url = config.llm_api_base or config.prm_url
+        # Workflow-engine LLM resolution. ``EVOLVE_LLM_BASE_URL`` /
+        # ``EVOLVE_LLM_API_KEY`` exist so an operator can point evolve
+        # at a different upstream than the SkillClaw proxy is using
+        # (e.g. local LiteLLM at :8088 for evolve while the proxy still
+        # passthroughs to dashscope).  When unset, fall back to the
+        # SkillClaw config so existing setups keep working.
+        llm_api_key = os.environ.get("EVOLVE_LLM_API_KEY") or config.llm_api_key or config.prm_api_key
+        llm_base_url = os.environ.get("EVOLVE_LLM_BASE_URL") or config.llm_api_base or config.prm_url
         llm_model = os.environ.get("EVOLVE_MODEL", config.llm_model_id or "gpt-4o")
         llm_api_type = os.environ.get("EVOLVE_LLM_API_TYPE", "openai-completions")
 
