@@ -143,6 +143,10 @@ _KIMI_TOOL_CALL_RE = re.compile(
     re.DOTALL,
 )
 _QWEN_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+# Suffix the external-session resolver appends on boundary.  Captured
+# here so ``_sanitize_raw_session_id`` can detect caller-supplied IDs
+# that already wear the SkillClaw-owned suffix.
+_SEG_SUFFIX_RE = re.compile(r":seg-\d+$")
 _TOOL_ARGS_MAX_CHARS = 4_000
 _TOOL_RESULT_CONTENT_MAX_CHARS = 4_000
 _SESSION_IDLE_CLOSE_SECONDS = 180
@@ -1514,6 +1518,26 @@ class SkillClawAPIServer:
         # Maps pseudo-session key (e.g. "tui-model") to tracking metadata.
         self._tui_session_meta: dict[str, dict] = {}
         _INACTIVITY_TIMEOUT = 300  # seconds — treat as new session after 5 min idle
+        # Session boundary detection for agents that DO supply an explicit
+        # session_id (Claude Code's ``x-claude-code-session-id``, Codex's
+        # ``session_id``, OpenClaw's ``X-Session-Id``).  These IDs are
+        # preserved across in-client compact/clear/resume so a 4-hour chat
+        # with three ``/compact``s would otherwise become one giant
+        # SkillClaw record.  Keyed by ``raw_session_id`` only (NOT by
+        # model) so a mid-session model switch keeps the same boundary
+        # state and ``:seg-N`` suffix namespace stays singular per raw_sid
+        # — matches downstream session_id namespace, which is also
+        # model-agnostic.
+        self._external_session_meta: dict[str, dict] = {}
+        # Single-flight gate around the resolver's mutation-across-await
+        # path.  Without it, two coroutines that both notice the boundary
+        # condition can both increment the segment counter and both fire
+        # ``_close_session`` (the second close is no-op'd by
+        # ``_closing_sessions`` but the counter still double-bumps and
+        # records arrive under the wrong segment).  Lazy-created on first
+        # use so ``SkillClawAPIServer`` can still be constructed outside
+        # an event loop (config validation, tests).
+        self._external_session_lock: Optional[asyncio.Lock] = None
         self._tui_inactivity_timeout = _INACTIVITY_TIMEOUT
 
         # Record files — resolve absolute path so the daemon writes
@@ -1660,8 +1684,28 @@ class SkillClawAPIServer:
                 )
 
             target_path = owner._record_file
-            session_id = str(body.get("session_id"))
+            raw_session_id = str(body.get("session_id"))
             turn_num = int(body.get("turn") or 0)
+            # CoPaw's hook posts ``session_id = "console:<sender>"``
+            # which is stable per-chat-thread for the lifetime of the
+            # chat — without boundary detection a single thread becomes
+            # one giant record forever.  CoPaw has no /compact (msg
+            # count grows monotonically), so in practice only the idle
+            # timeout fires here, but we run the helper so a future
+            # "clear chat" UI action that drops the msg count is also
+            # picked up.
+            msg_count = len(body.get("messages") or [])
+            session_id = await owner._resolve_external_session(
+                raw_session_id,
+                msg_count,
+            )
+            # Stamp the (possibly segmented) session_id back onto the
+            # record body so downstream readers (evolve queue, PRM) see
+            # the same identifier we logged + closed under.  This
+            # mutation is intentional: callers that read the JSONL
+            # after we write it should see the effective sid, not the
+            # pre-segmentation raw sid.
+            body["session_id"] = session_id
             logger.info(
                 "[ingest] session=%s turn=%s",
                 session_id, turn_num,
@@ -1796,11 +1840,14 @@ class SkillClawAPIServer:
             # Non-OpenClaw agents (QwenPaw, IronClaw, etc.) don't — detect
             # session boundaries heuristically so session upload and state
             # cleanup still work correctly.
+            msg_count = len(body.get("messages") or [])
             if _raw_sid:
-                session_id = _raw_sid
+                session_id = await owner._resolve_external_session(
+                    _raw_sid,
+                    msg_count,
+                )
                 turn_type = _resolve_turn_type(x_turn_type, body.get("turn_type"), default="main")
             else:
-                msg_count = len(body.get("messages") or [])
                 session_id = await owner._resolve_tui_session(
                     body.get("model", "default"),
                     msg_count,
@@ -1847,6 +1894,12 @@ class SkillClawAPIServer:
             previous_response_id = str(body.get("previous_response_id") or "").strip()
             store_response = bool(body.get("store", True))
             openai_body = _responses_to_openai_body(body, owner._served_model)
+            # Capture the wire-level msg_count BEFORE the previous-
+            # response history merge.  If we read it after the merge,
+            # a Codex /compact (50 wire msgs → 5) gets re-expanded back
+            # to 55 here and the boundary detector silently misses the
+            # drop.  This MUST stay above ``_merge_previous_response_messages``.
+            wire_msg_count = len(openai_body.get("messages") or [])
             if previous_response_id:
                 stored = owner._responses_store.get(previous_response_id)
                 if stored is None:
@@ -1859,15 +1912,15 @@ class SkillClawAPIServer:
                     list(openai_body.get("messages") or []),
                 )
             _raw_sid = x_session_id or codex_session_id or body.get("session_id") or ""
+            model = openai_body.get("model", owner._served_model)
             if _raw_sid:
-                session_id = _raw_sid
+                session_id = await owner._resolve_external_session(
+                    _raw_sid,
+                    wire_msg_count,
+                )
                 turn_type = _resolve_turn_type(x_turn_type, body.get("turn_type"), default="main")
             else:
-                msg_count = len(openai_body.get("messages") or [])
-                session_id = await owner._resolve_tui_session(
-                    openai_body.get("model", owner._served_model),
-                    msg_count,
-                )
+                session_id = await owner._resolve_tui_session(model, wire_msg_count)
                 turn_type = _resolve_turn_type(x_turn_type, body.get("turn_type"), default="main")
             session_done = _resolve_session_done(x_session_done, body.get("session_done"))
 
@@ -1976,11 +2029,14 @@ class SkillClawAPIServer:
                 openai_body["messages"] = rewritten_messages
 
             _raw_sid = x_session_id or x_claude_code_session_id or raw_body.get("session_id") or ""
+            msg_count = len(openai_body.get("messages") or [])
             if _raw_sid:
-                session_id = _raw_sid
+                session_id = await owner._resolve_external_session(
+                    _raw_sid,
+                    msg_count,
+                )
                 turn_type = _resolve_turn_type(x_turn_type, raw_body.get("turn_type"), default="main")
             else:
-                msg_count = len(openai_body.get("messages") or [])
                 session_id = await owner._resolve_tui_session(model, msg_count)
                 turn_type = _resolve_turn_type(x_turn_type, raw_body.get("turn_type"), default="main")
             session_done = _resolve_session_done(x_session_done, raw_body.get("session_done"))
@@ -2047,58 +2103,201 @@ class SkillClawAPIServer:
 
         When a boundary is detected the old session is flushed (session data
         uploaded, state dicts cleaned up) and a new unique id is assigned.
+
+        Single-flight gated for the same reason as
+        ``_resolve_external_session``: without the lock, two concurrent
+        callers on the same TUI model could both observe the boundary,
+        both ``await self._close_session(...)``, and both rewrite the
+        meta — the second writer wins, races on the new sid.
         """
         import uuid
 
-        tui_key = f"tui-{model}"
+        # Share the external-session lock — TUI and external paths are
+        # mutually exclusive per request but both serialize against
+        # ``_close_session`` reentry, so one lock covers both.
+        if self._external_session_lock is None:
+            self._external_session_lock = asyncio.Lock()
+
+        async with self._external_session_lock:
+            tui_key = f"tui-{model}"
+            now = time.time()
+            meta = self._tui_session_meta.get(tui_key)
+
+            if meta is None:
+                # First request for this model — start a fresh session.
+                sid = f"tui-{model}-{uuid.uuid4().hex[:8]}"
+                self._tui_session_meta[tui_key] = {
+                    "session_id": sid,
+                    "last_msg_count": msg_count,
+                    "last_request_time": now,
+                }
+                logger.info("[SessionDetect] new TUI session %s (first request)", sid)
+                return sid
+
+            new_session = False
+            if msg_count < meta["last_msg_count"]:
+                # Message count dropped → client started a new conversation.
+                new_session = True
+                logger.info(
+                    "[SessionDetect] msg count dropped %d → %d — new session",
+                    meta["last_msg_count"],
+                    msg_count,
+                )
+            elif (now - meta["last_request_time"]) > self._tui_inactivity_timeout:
+                new_session = True
+                idle_sec = int(now - meta["last_request_time"])
+                logger.info(
+                    "[SessionDetect] inactivity %ds > %ds — new session",
+                    idle_sec,
+                    self._tui_inactivity_timeout,
+                )
+
+            if new_session:
+                old_sid = meta["session_id"]
+                await self._close_session(old_sid, reason="tui_boundary")
+                sid = f"tui-{model}-{uuid.uuid4().hex[:8]}"
+                self._tui_session_meta[tui_key] = {
+                    "session_id": sid,
+                    "last_msg_count": msg_count,
+                    "last_request_time": now,
+                }
+                logger.info("[SessionDetect] new TUI session %s (replacing %s)", sid, old_sid)
+                return sid
+
+            # Same session — update tracking.
+            meta["last_msg_count"] = msg_count
+            meta["last_request_time"] = now
+            return meta["session_id"]
+
+    @staticmethod
+    def _sanitize_raw_session_id(raw_session_id: str) -> str:
+        """Strip a caller-supplied ``:seg-N`` suffix.
+
+        Without this, a caller (accidentally or maliciously) supplying
+        ``"abc:seg-2"`` as ``X-Session-Id`` would collide with the
+        segment-2 namespace of caller ``"abc"`` and merge two unrelated
+        sessions in ``conversations.jsonl`` / shared sessions / PRM
+        scores.  The ``:seg-N`` suffix is reserved for SkillClaw-emitted
+        IDs; we own that namespace.  Strip any incoming match so the
+        boundary state for the bare ID is what gets tracked.
+        """
+        match = _SEG_SUFFIX_RE.search(raw_session_id)
+        if match:
+            stripped = raw_session_id[: match.start()]
+            logger.warning(
+                "[SessionDetect] caller-supplied session_id %r contains "
+                "reserved ':seg-N' suffix — stripping to %r to avoid "
+                "namespace collision with SkillClaw-emitted segments.",
+                raw_session_id,
+                stripped,
+            )
+            return stripped
+        return raw_session_id
+
+    async def _resolve_external_session(
+        self,
+        raw_session_id: str,
+        msg_count: int,
+    ) -> str:
+        """Detect conversation boundaries when the caller supplies an
+        explicit session_id (Claude Code, Codex, OpenClaw, CoPaw ingest).
+
+        Claude Code's ``x-claude-code-session-id`` is preserved across
+        ``/compact``, ``/clear``, and ``/resume`` — so on the wire a
+        50-message session that compacts down to 5 keeps the same ID,
+        and without boundary detection SkillClaw lumps the pre- and
+        post-compact turns into one record (with PRM/OPD scored over
+        unrelated material).  We track per-``raw_session_id`` state
+        (model-agnostic so a mid-session model switch keeps the same
+        boundary state) and, on boundary, append a ``:seg-N`` suffix so
+        each segment is captured independently while staying grouped
+        under the originating session_id.
+
+        Boundary signals (same as ``_resolve_tui_session``):
+          1. ``msg_count`` dropped — caller compacted/cleared history.
+          2. Inactivity timeout — caller was idle for >N seconds.
+
+        Caller MUST pre-compute ``msg_count`` from the wire-level
+        message list, BEFORE any server-side history merge (e.g.
+        ``_merge_previous_response_messages`` on the Codex
+        ``/v1/responses`` path).  Otherwise the merge re-expands the
+        post-compact 5 messages back to 55 and the boundary is missed.
+
+        Known limitation (TODO follow-up): in-flight LLM requests that
+        capture ``session_id = current_sid`` at handler-top and then
+        await an upstream call can resume AFTER a concurrent boundary
+        close drained state for that sid.  The resumed request will
+        rebuild per-session dicts (``_pending_records[X]`` etc.) under
+        the closed sid, "resurrecting" it.  Data eventually lands when
+        the next idle-sweep close fires (≤ ``_SESSION_IDLE_CLOSE_SECONDS
+        + _SESSION_SWEEP_INTERVAL_SECONDS``), so it's not lost; but for
+        the window between resurrection and re-close, the data lives
+        only in process memory.  Proper fix requires per-request sid
+        pinning + a tail-segment redirect; out of scope for this
+        commit, tracked as follow-up.
+
+        Returns the effective session_id to use for this request.
+        """
+        raw_session_id = self._sanitize_raw_session_id(raw_session_id)
         now = time.time()
-        meta = self._tui_session_meta.get(tui_key)
 
-        if meta is None:
-            # First request for this model — start a fresh session.
-            sid = f"tui-{model}-{uuid.uuid4().hex[:8]}"
-            self._tui_session_meta[tui_key] = {
-                "session_id": sid,
-                "last_msg_count": msg_count,
-                "last_request_time": now,
-            }
-            logger.info("[SessionDetect] new TUI session %s (first request)", sid)
-            return sid
+        # Lazy-create the single-flight gate.  ``asyncio.Lock`` requires
+        # a running event loop in some Python versions; deferring to
+        # first use keeps ``SkillClawAPIServer`` constructible in sync
+        # contexts (config validation, test setup).
+        if self._external_session_lock is None:
+            self._external_session_lock = asyncio.Lock()
 
-        new_session = False
-        if msg_count < meta["last_msg_count"]:
-            # Message count dropped → client started a new conversation.
-            new_session = True
-            logger.info(
-                "[SessionDetect] msg count dropped %d → %d — new session",
-                meta["last_msg_count"],
-                msg_count,
-            )
-        elif (now - meta["last_request_time"]) > self._tui_inactivity_timeout:
-            new_session = True
-            idle_sec = int(now - meta["last_request_time"])
-            logger.info(
-                "[SessionDetect] inactivity %ds > %ds — new session",
-                idle_sec,
-                self._tui_inactivity_timeout,
-            )
+        async with self._external_session_lock:
+            meta = self._external_session_meta.get(raw_session_id)
 
-        if new_session:
-            old_sid = meta["session_id"]
-            await self._close_session(old_sid, reason="tui_boundary")
-            sid = f"tui-{model}-{uuid.uuid4().hex[:8]}"
-            self._tui_session_meta[tui_key] = {
-                "session_id": sid,
-                "last_msg_count": msg_count,
-                "last_request_time": now,
-            }
-            logger.info("[SessionDetect] new TUI session %s (replacing %s)", sid, old_sid)
-            return sid
+            if meta is None:
+                # First time we see this raw_session_id — record state
+                # and return the ID as-is.  No boundary call needed yet.
+                self._external_session_meta[raw_session_id] = {
+                    "segment": 1,
+                    "current_sid": raw_session_id,
+                    "last_msg_count": msg_count,
+                    "last_request_time": now,
+                }
+                return raw_session_id
 
-        # Same session — update tracking.
-        meta["last_msg_count"] = msg_count
-        meta["last_request_time"] = now
-        return meta["session_id"]
+            new_segment = False
+            if msg_count < meta["last_msg_count"]:
+                new_segment = True
+                logger.info(
+                    "[SessionDetect] external %s msg count dropped %d → %d — new segment",
+                    raw_session_id,
+                    meta["last_msg_count"],
+                    msg_count,
+                )
+            elif (now - meta["last_request_time"]) > self._tui_inactivity_timeout:
+                new_segment = True
+                idle_sec = int(now - meta["last_request_time"])
+                logger.info(
+                    "[SessionDetect] external %s inactivity %ds > %ds — new segment",
+                    raw_session_id,
+                    idle_sec,
+                    self._tui_inactivity_timeout,
+                )
+
+            if new_segment:
+                await self._close_session(
+                    meta["current_sid"],
+                    reason="external_boundary",
+                )
+                meta["segment"] += 1
+                meta["current_sid"] = f"{raw_session_id}:seg-{meta['segment']}"
+                logger.info(
+                    "[SessionDetect] external %s → segment %d (%s)",
+                    raw_session_id,
+                    meta["segment"],
+                    meta["current_sid"],
+                )
+
+            meta["last_msg_count"] = msg_count
+            meta["last_request_time"] = now
+            return meta["current_sid"]
 
     def _touch_session(self, session_id: str) -> None:
         if session_id:
@@ -2245,6 +2444,19 @@ class SkillClawAPIServer:
             for key, meta in list(self._tui_session_meta.items()):
                 if isinstance(meta, dict) and meta.get("session_id") == session_id:
                     self._tui_session_meta.pop(key, None)
+            # Symmetric eviction for the explicit-session-id state
+            # dict.  Without this, ``_external_session_meta`` grows
+            # monotonically (one entry per fresh raw_session_id ever
+            # seen) and an explicit ``session_done`` leaves a dangling
+            # ``current_sid`` pointing at the just-closed session — a
+            # subsequent request with the same raw_session_id and a
+            # non-decreasing msg_count would otherwise re-route records
+            # back into the closed session.  Compare against
+            # ``current_sid`` so we drop the entry whose effective sid
+            # matches what's being closed, regardless of segment depth.
+            for raw_key, meta in list(self._external_session_meta.items()):
+                if isinstance(meta, dict) and meta.get("current_sid") == session_id:
+                    self._external_session_meta.pop(raw_key, None)
         finally:
             self._closing_sessions.discard(session_id)
 
